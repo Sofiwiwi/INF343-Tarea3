@@ -18,14 +18,6 @@ const (
 	MessageTypeOK          = "OK"
 )
 
-// Message representa un mensaje genérico entre nodos
-type Message struct {
-	SenderID   int
-	TargetID   int // Usado para mensajes directos, 0 para broadcast (no implementado en este ejemplo específico)
-	MessageType string
-	Payload    string // Puede ser útil para enviar información adicional, como el ID del nuevo coordinador
-}
-
 // CoordinatorModule es la estructura para el módulo de coordinación
 type CoordinatorModule struct {
 	NodeID          int
