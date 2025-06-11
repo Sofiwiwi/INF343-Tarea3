@@ -22,16 +22,17 @@ type ServerNodeWrapper struct {
 	CurrentState    *servernode.Estado            // Estado replicado
 	InboundMessages chan servernode.Message
 	StopChan        chan struct{}
-	IsStopped       bool // Para simular la detención de un nodo
+	IsStopped       bool           // Para simular la detención de un nodo
+	NodeAddresses   map[int]string // Añadimos el mapa de direcciones aquí
+	MonitorStarted  bool           // Para saber si el MonitorMod ya se inició
 }
 
 // NewServerNodeWrapper crea un nuevo nodo simulado
-func NewServerNodeWrapper(id int, allNodeIDs []int) *ServerNodeWrapper {
+func NewServerNodeWrapper(id int, allNodeIDs []int, nodeAddresses map[int]string) *ServerNodeWrapper {
 	// Cargar estado persistente del propio nodo (NodeState)
 	nodeState, err := servernode.LoadNodeStateFromFile(id)
 	if err != nil {
-		fmt.Printf("Error cargando estado del nodo %d: %v. Creando nuevo estado.\\n", id, err)
-		// Si no se puede cargar, crea un nuevo estado de nodo
+		fmt.Printf("Error cargando estado del nodo %d: %v. Creando nuevo estado.\n", id, err)
 		nodeState = &servernode.Nodo{ID: id, IsPrimary: false, LastMessage: time.Now().Format(time.RFC3339)}
 	}
 
@@ -41,7 +42,7 @@ func NewServerNodeWrapper(id int, allNodeIDs []int) *ServerNodeWrapper {
 	// Cargar el estado replicado del log de eventos
 	currentState, err := persistenceMod.LoadState()
 	if err != nil {
-		fmt.Printf("Error cargando estado replicado para el nodo %d: %v. Inicializando estado vacío.\\n", id, err)
+		fmt.Printf("Error cargando estado replicado para el nodo %d: %v. Inicializando estado vacío.\n", id, err)
 		currentState = &servernode.Estado{SequenceNumber: 0, EventLog: []servernode.Evento{}}
 	}
 
@@ -61,6 +62,8 @@ func NewServerNodeWrapper(id int, allNodeIDs []int) *ServerNodeWrapper {
 		InboundMessages: make(chan servernode.Message, 100), // Buffer para mensajes entrantes
 		StopChan:        make(chan struct{}),
 		IsStopped:       false,
+		NodeAddresses:   nodeAddresses, // Guardamos el mapa de direcciones en el wrapper
+		MonitorStarted:  false,
 	}
 }
 
@@ -68,15 +71,12 @@ func NewServerNodeWrapper(id int, allNodeIDs []int) *ServerNodeWrapper {
 func (snw *ServerNodeWrapper) Start() {
 	fmt.Printf("Nodo %d: Iniciando módulos...\n", snw.NodeID)
 
-	// Iniciar monitoreo en una goroutine
-	go snw.MonitorMod.Start()
-
 	// Goroutine para procesar mensajes entrantes
 	go func() {
 		for {
 			select {
 			case msg := <-snw.InboundMessages:
-				fmt.Printf("Nodo %d: Mensaje recibido: %+v\n", snw.NodeID, msg)
+				// fmt.Printf("Nodo %d: Mensaje recibido: %+v\n", snw.NodeID, msg) // Descomentar para debug
 				snw.processMessage(msg)
 			case <-snw.StopChan:
 				fmt.Printf("Nodo %d: Deteniendo procesamiento de mensajes.\n", snw.NodeID)
@@ -85,12 +85,25 @@ func (snw *ServerNodeWrapper) Start() {
 		}
 	}()
 
-	// Iniciar la primera elección al arrancar si es el nodo con el ID más alto
-	// Esto es una simplificación; en un sistema real, se usaría algún mecanismo de descubrimiento de nodos.
-	// O el nodo de mayor ID siempre inicia la primera elección.
+	// Si el nodo es el de mayor ID, iniciar elección inicial
 	if snw.NodeID == max(snw.CoordinatorMod.Nodes...) {
 		fmt.Printf("Nodo %d: Soy el nodo con el ID más alto (%d), iniciando primera elección.\n", snw.NodeID, snw.NodeID)
-		snw.CoordinatorMod.StartElection()
+		go snw.CoordinatorMod.StartElection() // Ejecutar en goroutine para no bloquear Start
+	} else if snw.NodeState.IsPrimary {
+		// Si el nodo cargó de persistencia como primario, anuncia su coordinación
+		fmt.Printf("Nodo %d: Cargado como primario desde persistencia. Anunciando coordinación.\n", snw.NodeID)
+		go snw.CoordinatorMod.AnnounceCoordinator()
+	} else {
+		// Si es un nodo secundario y no hay primario conocido (o cargó como secundario),
+		// esperará un mensaje COORDINATOR para iniciar el monitoreo y sincronización.
+		fmt.Printf("Nodo %d: Esperando anuncio de primario para iniciar monitoreo y sincronización.\n", snw.NodeID)
+	}
+
+	// Si el nodo ya es primario (por persistencia o por ser el más alto al inicio),
+	// iniciar el monitoreo (aunque un primario no monitorea a otro primario, es bueno que el módulo se inicie)
+	if snw.NodeState.IsPrimary && !snw.MonitorStarted {
+		go snw.MonitorMod.Start()
+		snw.MonitorStarted = true
 	}
 }
 
@@ -112,7 +125,7 @@ func (snw *ServerNodeWrapper) processMessage(msg servernode.Message) {
 		fmt.Printf("Nodo %d: Recibió mensaje ELECTION de %d\n", snw.NodeID, msg.SenderID)
 		snw.CoordinatorMod.HandleElectionMessage(msg.SenderID)
 	case servernode.MessageTypeOK:
-		fmt.Printf("Nodo %d: Recibió mensaje OK de %d\n", snw.NodeID, msg.SenderID)
+		// fmt.Printf("Nodo %d: Recibió mensaje OK de %d\n", snw.NodeID, msg.SenderID) // Descomentar para debug
 		snw.CoordinatorMod.HandleOKMessage(msg.SenderID)
 	case servernode.MessageTypeCoordinator:
 		fmt.Printf("Nodo %d: Recibió mensaje COORDINATOR de %d\n", snw.NodeID, msg.SenderID)
@@ -124,18 +137,28 @@ func (snw *ServerNodeWrapper) processMessage(msg servernode.Message) {
 			return
 		}
 		snw.CoordinatorMod.HandleCoordinatorMessage(payloadData.CoordinatorID)
+
+		// Si el nodo actual es un secundario y el MonitorMod no ha iniciado, iniciarlo ahora.
+		if !snw.NodeState.IsPrimary && !snw.MonitorStarted {
+			go snw.MonitorMod.Start()
+			snw.MonitorStarted = true
+			fmt.Printf("Nodo %d: Primario conocido (%d). Iniciando monitoreo y solicitando sincronización.\n", snw.NodeID, snw.CoordinatorMod.PrimaryID)
+			go snw.SyncMod.ReconcileStateWithPrimary() // Iniciar sincronización en goroutine
+		} else if snw.NodeState.IsPrimary {
+			fmt.Printf("Nodo %d (Primario): Me anunciaron como primario. No necesito iniciar monitoreo.\n", snw.NodeID)
+		} else {
+			fmt.Printf("Nodo %d: Monitor ya iniciado o no primario. No se requiere acción adicional de monitoreo.\n", snw.NodeID)
+		}
+
 	case servernode.MessageTypeAreYouAlive:
-		fmt.Printf("Nodo %d: Recibió mensaje ARE_YOU_ALIVE de %d. Respondiendo OK.\n", snw.NodeID, msg.SenderID)
+		// fmt.Printf("Nodo %d: Recibió mensaje ARE_YOU_ALIVE de %d. Respondiendo OK.\n", snw.NodeID, msg.SenderID) // Descomentar para debug
 		snw.CoordinatorMod.SendOKMessage(msg.SenderID) // Responde directamente con OK
 	case servernode.MessageTypeRequestState:
 		fmt.Printf("Nodo %d: Recibió mensaje REQUEST_STATE de %d. Enviando estado.\n", snw.NodeID, msg.SenderID)
-		// El nodo primario debe enviar su estado completo al solicitante
 		if snw.CoordinatorMod.IsPrimary {
 			snw.SyncMod.SendStateMessage(msg.SenderID, *snw.CurrentState)
 		} else {
-			// Si no es primario, se asume que el solicitante quiere el estado del primario
-			// o el solicitante puede reintentar con el primario conocido.
-			fmt.Printf("Nodo %d: Solicitud de estado recibida de %d, pero no soy primario.\n", snw.NodeID, msg.SenderID)
+			fmt.Printf("Nodo %d: Solicitud de estado recibida de %d, pero no soy primario. Primario conocido: %d.\n", snw.NodeID, msg.SenderID, snw.CoordinatorMod.PrimaryID)
 		}
 	case servernode.MessageTypeSendState:
 		fmt.Printf("Nodo %d: Recibió mensaje SEND_STATE de %d. Actualizando estado.\n", snw.NodeID, msg.SenderID)
@@ -177,6 +200,12 @@ func max(nums ...int) int {
 
 // SendMessageOverNetwork envía un mensaje a través de la red a un nodo objetivo.
 func SendMessageOverNetwork(senderID, targetID int, messageType, payload string, nodeAddresses map[int]string) {
+	// Verificar que el targetID sea válido
+	if targetID == -1 {
+		// fmt.Printf("Error: Intentando enviar mensaje a un targetID inválido (-1).\n") // Descomentar para debug
+		return // No intentar enviar a un ID inválido
+	}
+
 	targetAddr := nodeAddresses[targetID]
 	if targetAddr == "" {
 		fmt.Printf("Error: No se encontró la dirección para el nodo %d\n", targetID)
@@ -185,8 +214,8 @@ func SendMessageOverNetwork(senderID, targetID int, messageType, payload string,
 
 	conn, err := net.Dial("tcp", targetAddr)
 	if err != nil {
-		fmt.Printf("Error al conectar con el nodo %d (%s): %v\n", targetID, targetAddr, err)
-		return
+		// fmt.Printf("Error al conectar con el nodo %d (%s): %v\n", targetID, targetAddr, err) // Descomentar para debug de conexiones
+		return // Retornar silenciosamente si no se puede conectar (nodo caído o no levantado)
 	}
 	defer conn.Close()
 
@@ -206,7 +235,7 @@ func SendMessageOverNetwork(senderID, targetID int, messageType, payload string,
 	// Asegúrate de que el mensaje termine con un salto de línea para que ReadBytes('\n') funcione
 	_, err = conn.Write(append(jsonMsg, '\n'))
 	if err != nil {
-		fmt.Printf("Error al enviar el mensaje al nodo %d: %v\n", targetID, err)
+		// fmt.Printf("Error al enviar el mensaje al nodo %d: %v\n", targetID, err) // Descomentar para debug de envío
 	}
 }
 
@@ -223,13 +252,8 @@ func ListenForMessages(node *ServerNodeWrapper, listenAddr string) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			// Manejar el error de conexión si el listener se cierra o hay problemas de red
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				fmt.Printf("Nodo %d: Error de timeout al aceptar conexión: %v\n", node.NodeID, err)
-				continue
-			}
 			if opErr, ok := err.(*net.OpError); ok && opErr.Op == "accept" && opErr.Net == "tcp" && opErr.Err.Error() == "use of closed network connection" {
-				// El listener fue cerrado intencionalmente
+				// El listener fue cerrado intencionalmente (ej. al detener el programa)
 				fmt.Printf("Nodo %d: Listener cerrado.\n", node.NodeID)
 				return
 			}
@@ -252,7 +276,8 @@ func handleConnection(conn net.Conn, node *ServerNodeWrapper) {
 	}
 
 	var msg servernode.Message
-	err = json.Unmarshal(messageBytes, &msg)
+	// Eliminar el salto de línea antes de deserializar
+	err = json.Unmarshal(messageBytes[:len(messageBytes)-1], &msg)
 	if err != nil {
 		fmt.Printf("Nodo %d: Error al deserializar el mensaje de %s (%s): %v\n", node.NodeID, conn.RemoteAddr(), string(messageBytes), err)
 		return
@@ -281,7 +306,6 @@ func main() {
 	}
 
 	// Definimos las IPs y puertos de todos los nodos.
-	// Esto se debe mantener consistente en todas las instancias de main.go
 	nodeAddresses := map[int]string{
 		1: "10.10.28.17:8001",
 		2: "10.10.28.18:8001",
@@ -297,20 +321,17 @@ func main() {
 	}
 
 	// Inicialización del nodo actual
-	node := NewServerNodeWrapper(nodeID, nodeIDs)
+	node := NewServerNodeWrapper(nodeID, nodeIDs, nodeAddresses) // Pasar nodeAddresses al constructor
 
 	// Redefinir las funciones de envío de mensajes de los módulos para usar la red real
 	node.CoordinatorMod.SendElectionMessage = func(targetID int) bool {
 		fmt.Printf("Nodo %d: Enviando ELECTION a Nodo %d\n", node.NodeID, targetID)
 		SendMessageOverNetwork(node.NodeID, targetID, servernode.MessageTypeElection, "", nodeAddresses)
-		// Para una elección real, necesitarías esperar una respuesta 'OK' en un tiempo límite.
-		// Aquí, para simplificar, asumimos que el envío es "exitoso" para el propósito del algoritmo.
-		// El módulo de coordinación manejará los timeouts si no recibe OK.
-		return true // Asume que el mensaje fue intentado enviar
+		return true
 	}
 
 	node.CoordinatorMod.SendOKMessage = func(targetID int) {
-		fmt.Printf("Nodo %d: Enviando OK a Nodo %d\n", node.NodeID, targetID)
+		// fmt.Printf("Nodo %d: Enviando OK a Nodo %d\n", node.NodeID, targetID) // Descomentar para debug
 		SendMessageOverNetwork(node.NodeID, targetID, servernode.MessageTypeOK, "", nodeAddresses)
 	}
 
@@ -350,32 +371,41 @@ func main() {
 	}
 
 	node.MonitorMod.SendHeartbeat = func(targetID int) bool {
-		fmt.Printf("Nodo %d: Enviando ARE_YOU_ALIVE a Nodo %d\n", node.NodeID, targetID)
+		// fmt.Printf("Nodo %d: Enviando ARE_YOU_ALIVE a Nodo %d\n", node.NodeID, targetID) // Descomentar para debug
 		SendMessageOverNetwork(node.NodeID, targetID, servernode.MessageTypeAreYouAlive, "", nodeAddresses)
-		// Para un heartbeat real, esperarías una respuesta "OK" en un tiempo límite.
-		// La lógica de `MonitorModule` ya espera esta respuesta indirectamente (si no hay OK, asume caído).
-		return true // Asume que el intento de envío es exitoso.
+		return true
 	}
 
 	// Iniciar el listener de mensajes para este nodo en su dirección IP y puerto
 	go ListenForMessages(node, nodeAddresses[nodeID])
 
-	// Iniciar los módulos del nodo
+	// Iniciar los módulos del nodo (sin el MonitorMod inicial)
 	node.Start()
 
 	// --- Lógica de la simulación principal (para el nodo primario) ---
-	// Esta parte de la lógica es solo para simular la adición de eventos en el primario.
-	// En un sistema real, un cliente externo o una aplicación dispararía estas acciones.
-	if nodeID == 1 { // Suponemos que el nodo 1 es el primario inicial y el que añade eventos.
-		fmt.Println("\n--- Nodo 1 (Primario Inicial): Esperando a que el sistema se estabilice para añadir eventos ---")
-		time.Sleep(10 * time.Second) // Dar tiempo para que los nodos arranquen y elijan primario
+	if nodeID == 1 { // Suponemos que el nodo 1 es el que añade eventos.
+		fmt.Println("\n--- Nodo 1: Esperando que el sistema se estabilice y haya un primario conocido antes de añadir eventos simulados ---")
+		// Esperar hasta que el nodo 1 sea primario o conozca a un primario
+		for {
+			time.Sleep(2 * time.Second)
+			if node.NodeState.IsPrimary || node.CoordinatorMod.PrimaryID != -1 {
+				break
+			}
+			fmt.Printf("Nodo 1: Esperando primario conocido (actual: %d).\n", node.CoordinatorMod.PrimaryID)
+		}
+		time.Sleep(5 * time.Second) // Dar tiempo adicional para que el sistema se estabilice
 
 		fmt.Println("\n--- Nodo 1 (Posible Primario): Agregando eventos ---")
-		node.SyncMod.AddEvent(servernode.Evento{ID: 1, Value: "primer evento"})
-		time.Sleep(1 * time.Second)
-		node.SyncMod.AddEvent(servernode.Evento{ID: 2, Value: "segundo evento"})
-		time.Sleep(1 * time.Second)
-		node.SyncMod.AddEvent(servernode.Evento{ID: 3, Value: "tercer evento"})
+		if node.NodeState.IsPrimary {
+			fmt.Println("Nodo 1: Es primario, añadiendo eventos.")
+			node.SyncMod.AddEvent(servernode.Evento{ID: 1, Value: "primer evento"})
+			time.Sleep(1 * time.Second)
+			node.SyncMod.AddEvent(servernode.Evento{ID: 2, Value: "segundo evento"})
+			time.Sleep(1 * time.Second)
+			node.SyncMod.AddEvent(servernode.Evento{ID: 3, Value: "tercer evento"})
+		} else {
+			fmt.Println("Nodo 1: No es primario, no se añaden eventos simulados.")
+		}
 	}
 
 	// Mantener el nodo corriendo indefinidamente
