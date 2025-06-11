@@ -1,12 +1,14 @@
 package main
 
 import (
-	"INF343-Tarea3/servernode"
+	"INF343-Tarea3/servernode" // Asegúrate de que esta ruta sea correcta para tu proyecto
+	"bufio"
+	"encoding/json"
 	"fmt"
-	//"os"
+	"net"
+	"os"
 	"strconv"
 	"time"
-	"encoding/json"
 )
 
 // ServerNodeWrapper simula una instancia de un ServerNode que contiene los módulos.
@@ -16,8 +18,8 @@ type ServerNodeWrapper struct {
 	MonitorMod      *servernode.MonitorModule
 	SyncMod         *servernode.SynchronizationModule
 	PersistenceMod  *servernode.PersistenceModule // Añadir referencia al módulo de persistencia
-	NodeState       *servernode.Nodo             // Utiliza servernode.Nodo
-	CurrentState    *servernode.Estado           // Estado replicado
+	NodeState       *servernode.Nodo              // Utiliza servernode.Nodo
+	CurrentState    *servernode.Estado            // Estado replicado
 	InboundMessages chan servernode.Message
 	StopChan        chan struct{}
 	IsStopped       bool // Para simular la detención de un nodo
@@ -26,304 +28,315 @@ type ServerNodeWrapper struct {
 // NewServerNodeWrapper crea un nuevo nodo simulado
 func NewServerNodeWrapper(id int, allNodeIDs []int) *ServerNodeWrapper {
 	// Cargar estado persistente del propio nodo (NodeState)
-	// Esta función está en coordinacion.go
 	nodeState, err := servernode.LoadNodeStateFromFile(id)
 	if err != nil {
-		fmt.Printf("Error cargando estado del nodo %d: %v. Creando nuevo estado.\n", id, err)
+		fmt.Printf("Error cargando estado del nodo %d: %v. Creando nuevo estado.\\n", id, err)
+		// Si no se puede cargar, crea un nuevo estado de nodo
 		nodeState = &servernode.Nodo{ID: id, IsPrimary: false, LastMessage: time.Now().Format(time.RFC3339)}
 	}
 
 	// Inicializar el módulo de persistencia para este nodo
 	persistenceMod := servernode.NewPersistenceModule(id)
 
-	// Cargar estado replicado (o inicializarlo si no existe) usando el PersistenceModule
+	// Cargar el estado replicado del log de eventos
 	currentState, err := persistenceMod.LoadState()
 	if err != nil {
-		fmt.Printf("Error cargando estado replicado para nodo %d: %v. Inicializando vacío.\n", id, err)
+		fmt.Printf("Error cargando estado replicado para el nodo %d: %v. Inicializando estado vacío.\\n", id, err)
 		currentState = &servernode.Estado{SequenceNumber: 0, EventLog: []servernode.Evento{}}
 	}
 
-	sn := &ServerNodeWrapper{
+	coordinatorMod := servernode.NewCoordinatorModule(id, allNodeIDs, nodeState)
+	// MonitorMod necesita el CoordinatorMod, y el PrimaryID se establece dinámicamente
+	monitorMod := servernode.NewMonitorModule(id, -1, coordinatorMod) // PrimaryID inicial -1
+	syncMod := servernode.NewSynchronizationModule(id, coordinatorMod, currentState, nodeState, persistenceMod)
+
+	return &ServerNodeWrapper{
 		NodeID:          id,
+		CoordinatorMod:  coordinatorMod,
+		MonitorMod:      monitorMod,
+		SyncMod:         syncMod,
+		PersistenceMod:  persistenceMod,
 		NodeState:       nodeState,
-		CurrentState:    currentState, // Usar el estado cargado/inicializado por PersistenceMod
-		InboundMessages: make(chan servernode.Message, 100),
+		CurrentState:    currentState,
+		InboundMessages: make(chan servernode.Message, 100), // Buffer para mensajes entrantes
 		StopChan:        make(chan struct{}),
 		IsStopped:       false,
-		PersistenceMod:  persistenceMod, // Asignar el módulo de persistencia
 	}
-
-	// Crear módulos
-	sn.CoordinatorMod = servernode.NewCoordinatorModule(id, allNodeIDs, sn.NodeState)
-	// El PrimaryID inicial para el monitoreo debería venir del coordinador si ya lo sabe, o ser -1.
-	// Aquí asumimos que el coordinador aún no sabe quién es el primario al inicio, lo determinará la elección.
-	sn.MonitorMod = servernode.NewMonitorModule(id, -1, sn.CoordinatorMod)
-
-	// CORRECCIÓN del ERROR 1: Pasar los 5 argumentos en el orden correcto a NewSynchronizationModule
-	sn.SyncMod = servernode.NewSynchronizationModule(id, sn.CoordinatorMod, sn.CurrentState, sn.NodeState, sn.PersistenceMod)
-
-	return sn
 }
 
-// Start simula el bucle principal de un nodo
-func (sn *ServerNodeWrapper) Start(nodesMap map[int]*ServerNodeWrapper) {
-	fmt.Printf("Nodo %d: Iniciando...\n", sn.NodeID)
-	sn.IsStopped = false
+// Start inicia los módulos del nodo y el procesamiento de mensajes entrantes.
+func (snw *ServerNodeWrapper) Start() {
+	fmt.Printf("Nodo %d: Iniciando módulos...\n", snw.NodeID)
 
-	// Iniciar monitoreo si no es el primario inicial
-	// El primario no se monitorea a sí mismo. Los secundarios sí.
-	if !sn.NodeState.IsPrimary {
-		sn.MonitorMod.Start()
-	}
+	// Iniciar monitoreo en una goroutine
+	go snw.MonitorMod.Start()
 
-
+	// Goroutine para procesar mensajes entrantes
 	go func() {
 		for {
 			select {
-			case msg := <-sn.InboundMessages:
-				if sn.IsStopped { // Si el nodo está detenido, no procesa mensajes
-					continue
-				}
-				fmt.Printf("Nodo %d: Recibido mensaje tipo '%s' de Nodo %d\n", sn.NodeID, msg.MessageType, msg.SenderID)
-				switch msg.MessageType {
-				case servernode.MessageTypeElection:
-					sn.CoordinatorMod.HandleElectionMessage(msg.SenderID)
-				case servernode.MessageTypeOK:
-					// Este OK podría ser para una elección o un heartbeat.
-					// Aquí, lo manejamos genéricamente para elecciones o simplemente se loguea.
-					fmt.Printf("Nodo %d: Recibido OK de Nodo %d.\n", sn.NodeID, msg.SenderID)
-				case servernode.MessageTypeCoordinator:
-					coordinatorID, _ := strconv.Atoi(msg.Payload)
-					sn.CoordinatorMod.HandleCoordinatorMessage(coordinatorID)
-					// Una vez que se sabe quién es el primario, si yo no soy el primario, solicito sincronización.
-					if sn.NodeID != sn.CoordinatorMod.PrimaryID { // Si no soy el primario asignado
-						// Espera un poco para que todos los nodos actualicen su PrimaryID
-						time.Sleep(500 * time.Millisecond) // Simular latencia de propagación de mensaje
-						sn.SyncMod.RequestStateFromPrimary()
-					}
-
-				case servernode.MessageTypeAreYouAlive: // Mensaje de heartbeat
-					// El módulo de monitoreo del nodo receptor debería manejar esto y responder OK
-					// Para la simulación, respondemos directamente aquí.
-					go func() {
-						if nodesMap[msg.SenderID] != nil && !nodesMap[msg.SenderID].IsStopped {
-							SimulateSendMessage(sn.NodeID, msg.SenderID, servernode.MessageTypeOK, "", nodesMap)
-						}
-					}()
-				case servernode.MessageTypeRequestState: // Solicitud de estado
-					requesterSequence, _ := strconv.Atoi(msg.Payload)
-					sn.SyncMod.HandleRequestStateMessage(msg.SenderID, requesterSequence)
-				case servernode.MessageTypeSendState: // Envío de estado completo
-					var newState servernode.Estado
-					if err := json.Unmarshal([]byte(msg.Payload), &newState); err != nil {
-						fmt.Printf("Nodo %d: Error al deserializar estado recibido: %v\n", sn.NodeID, err)
-					} else {
-						sn.SyncMod.HandleReceiveState(newState)
-					}
-				case servernode.MessageTypeSendLog: // Envío de log incremental (BONUS)
-					var payloadData struct {
-						Entries        []servernode.Evento `json:"entries"`
-						SequenceNumber int                 `json:"sequence_number"`
-					}
-					if err := json.Unmarshal([]byte(msg.Payload), &payloadData); err != nil {
-						fmt.Printf("Nodo %d: Error al deserializar entradas de log recibidas: %v\n", sn.NodeID, err)
-					} else {
-						sn.SyncMod.HandleReceiveLogEntries(payloadData.Entries, payloadData.SequenceNumber)
-					}
-				}
-			case <-sn.StopChan:
-				fmt.Printf("Nodo %d: Detenido.\n", sn.NodeID)
-				sn.IsStopped = true
-				if sn.MonitorMod != nil {
-					sn.MonitorMod.Stop() // Detener el monitoreo al detener el nodo
-				}
-				// Persistir el estado del propio nodo (NodeState) y el estado replicado (CurrentState) antes de detenerse
-				sn.NodeState.SaveNodeStateToFile() // Guarda el 'Node' struct
-				sn.PersistenceMod.SaveState(sn.CurrentState) // Guarda el 'Estado' replicado
+			case msg := <-snw.InboundMessages:
+				fmt.Printf("Nodo %d: Mensaje recibido: %+v\n", snw.NodeID, msg)
+				snw.processMessage(msg)
+			case <-snw.StopChan:
+				fmt.Printf("Nodo %d: Deteniendo procesamiento de mensajes.\n", snw.NodeID)
 				return
 			}
 		}
 	}()
 
-	// Simulación de un primario inicial
-	// Si el nodo 1 es el primario inicial, no inicia el monitoreo.
-	if sn.NodeID == 1 {
-		sn.CoordinatorMod.IsPrimary = true
-		sn.CoordinatorMod.PrimaryID = sn.NodeID
-		sn.NodeState.IsPrimary = true
-		fmt.Printf("Nodo %d: Inicialmente es primario.\n", sn.NodeID)
-		sn.MonitorMod.Stop() // El primario no necesita monitorearse a sí mismo
+	// Iniciar la primera elección al arrancar si es el nodo con el ID más alto
+	// Esto es una simplificación; en un sistema real, se usaría algún mecanismo de descubrimiento de nodos.
+	// O el nodo de mayor ID siempre inicia la primera elección.
+	if snw.NodeID == max(snw.CoordinatorMod.Nodes...) {
+		fmt.Printf("Nodo %d: Soy el nodo con el ID más alto (%d), iniciando primera elección.\n", snw.NodeID, snw.NodeID)
+		snw.CoordinatorMod.StartElection()
 	}
-
-	// Simulación de adición de eventos al primario
-	if sn.NodeState.IsPrimary {
-		go func() {
-			ticker := time.NewTicker(4 * time.Second)
-			defer ticker.Stop()
-			// El contador de eventos debe comenzar desde el último SequenceNumber cargado/existente
-			eventCounter := sn.CurrentState.SequenceNumber
-			for {
-				select {
-				case <-ticker.C:
-					// Solo si este nodo es realmente el primario en este momento
-					if sn.NodeState.IsPrimary {
-						eventCounter++
-						newEvent := servernode.Evento{ID: eventCounter, Value: fmt.Sprintf("Mensaje_%d_de_Nodo%d", eventCounter, sn.NodeID)}
-						// CORRECCIÓN del ERROR 2: Usar UpdateStateFromEvent
-						sn.SyncMod.UpdateStateFromEvent(newEvent) // El primario actualiza su estado y lo replica (y persiste a través de SyncMod)
-					}
-				case <-sn.StopChan:
-					return
-				}
-			}
-		}()
-	}
-
-	// Esto es solo para que el goroutine principal no termine
-	<-sn.StopChan
 }
 
-// Stop detiene el nodo
-func (sn *ServerNodeWrapper) Stop() {
-	close(sn.StopChan)
-	sn.IsStopped = true
+// Stop detiene el nodo simulado.
+func (snw *ServerNodeWrapper) Stop() {
+	fmt.Printf("Nodo %d: Deteniendo nodo...\n", snw.NodeID)
+	snw.IsStopped = true
+	snw.MonitorMod.Stop()
+	close(snw.StopChan)
+	// Guardar estado al detener
+	snw.NodeState.SaveNodeStateToFile()
+	snw.PersistenceMod.SaveState(snw.CurrentState)
 }
 
-// SimulateSendMessage es una función para simular el envío de mensajes entre nodos.
-// Es una abstracción para el main para dirigir los mensajes.
-func SimulateSendMessage(senderID int, targetID int, messageType string, payload string, nodes map[int]*ServerNodeWrapper) {
-	msg := servernode.Message{ // Asegúrate de que Message se defina en servernode/coordinacion.go o servernode/sincronizacion.go
-		SenderID:   senderID,
-		TargetID:   targetID,
-		MessageType: messageType,
-		Payload:    payload,
-	}
-
-	if targetID == 0 { // Broadcast (considerar si es necesario para tu tarea)
-		for _, node := range nodes {
-			if node.NodeID != senderID && !node.IsStopped {
-				node.InboundMessages <- msg
-			}
+// processMessage maneja los mensajes entrantes y los dirige al módulo apropiado
+func (snw *ServerNodeWrapper) processMessage(msg servernode.Message) {
+	switch msg.MessageType {
+	case servernode.MessageTypeElection:
+		fmt.Printf("Nodo %d: Recibió mensaje ELECTION de %d\n", snw.NodeID, msg.SenderID)
+		snw.CoordinatorMod.HandleElectionMessage(msg.SenderID)
+	case servernode.MessageTypeOK:
+		fmt.Printf("Nodo %d: Recibió mensaje OK de %d\n", snw.NodeID, msg.SenderID)
+		snw.CoordinatorMod.HandleOKMessage(msg.SenderID)
+	case servernode.MessageTypeCoordinator:
+		fmt.Printf("Nodo %d: Recibió mensaje COORDINATOR de %d\n", snw.NodeID, msg.SenderID)
+		var payloadData struct {
+			CoordinatorID int `json:"coordinator_id"`
 		}
-	} else if node, ok := nodes[targetID]; ok {
-		if !node.IsStopped {
-			node.InboundMessages <- msg
+		if err := json.Unmarshal([]byte(msg.Payload), &payloadData); err != nil {
+			fmt.Printf("Nodo %d: Error al deserializar payload COORDINATOR: %v\n", snw.NodeID, err)
+			return
+		}
+		snw.CoordinatorMod.HandleCoordinatorMessage(payloadData.CoordinatorID)
+	case servernode.MessageTypeAreYouAlive:
+		fmt.Printf("Nodo %d: Recibió mensaje ARE_YOU_ALIVE de %d. Respondiendo OK.\n", snw.NodeID, msg.SenderID)
+		snw.CoordinatorMod.SendOKMessage(msg.SenderID) // Responde directamente con OK
+	case servernode.MessageTypeRequestState:
+		fmt.Printf("Nodo %d: Recibió mensaje REQUEST_STATE de %d. Enviando estado.\n", snw.NodeID, msg.SenderID)
+		// El nodo primario debe enviar su estado completo al solicitante
+		if snw.CoordinatorMod.IsPrimary {
+			snw.SyncMod.SendStateMessage(msg.SenderID, *snw.CurrentState)
 		} else {
-			fmt.Printf("Simulación: Mensaje de %d a %d (tipo %s) no entregado, nodo destino está detenido.\n", senderID, targetID, messageType)
+			// Si no es primario, se asume que el solicitante quiere el estado del primario
+			// o el solicitante puede reintentar con el primario conocido.
+			fmt.Printf("Nodo %d: Solicitud de estado recibida de %d, pero no soy primario.\n", snw.NodeID, msg.SenderID)
 		}
-	} else {
-		fmt.Printf("Error: Nodo destino %d no encontrado para el mensaje de %d.\n", targetID, senderID)
+	case servernode.MessageTypeSendState:
+		fmt.Printf("Nodo %d: Recibió mensaje SEND_STATE de %d. Actualizando estado.\n", snw.NodeID, msg.SenderID)
+		var receivedState servernode.Estado
+		if err := json.Unmarshal([]byte(msg.Payload), &receivedState); err != nil {
+			fmt.Printf("Nodo %d: Error al deserializar payload SEND_STATE: %v\n", snw.NodeID, err)
+			return
+		}
+		snw.SyncMod.UpdateState(&receivedState)
+	case servernode.MessageTypeSendLog:
+		fmt.Printf("Nodo %d: Recibió mensaje SEND_LOG de %d. Añadiendo entradas de log.\n", snw.NodeID, msg.SenderID)
+		var payloadData struct {
+			Entries        []servernode.Evento `json:"entries"`
+			SequenceNumber int                 `json:"sequence_number"`
+		}
+		if err := json.Unmarshal([]byte(msg.Payload), &payloadData); err != nil {
+			fmt.Printf("Nodo %d: Error al deserializar payload SEND_LOG: %v\n", snw.NodeID, err)
+			return
+		}
+		snw.SyncMod.AddLogEntries(payloadData.Entries, payloadData.SequenceNumber)
+	default:
+		fmt.Printf("Nodo %d: Mensaje de tipo desconocido: %s\n", snw.NodeID, msg.MessageType)
+	}
+}
+
+// Función auxiliar para obtener el máximo de una lista de enteros
+func max(nums ...int) int {
+	if len(nums) == 0 {
+		return 0 // O error, dependiendo del caso de uso
+	}
+	m := nums[0]
+	for _, v := range nums {
+		if v > m {
+			m = v
+		}
+	}
+	return m
+}
+
+// SendMessageOverNetwork envía un mensaje a través de la red a un nodo objetivo.
+func SendMessageOverNetwork(senderID, targetID int, messageType, payload string, nodeAddresses map[int]string) {
+	targetAddr := nodeAddresses[targetID]
+	if targetAddr == "" {
+		fmt.Printf("Error: No se encontró la dirección para el nodo %d\n", targetID)
+		return
+	}
+
+	conn, err := net.Dial("tcp", targetAddr)
+	if err != nil {
+		fmt.Printf("Error al conectar con el nodo %d (%s): %v\n", targetID, targetAddr, err)
+		return
+	}
+	defer conn.Close()
+
+	msg := servernode.Message{
+		SenderID:    senderID,
+		TargetID:    targetID,
+		MessageType: messageType,
+		Payload:     payload,
+	}
+
+	jsonMsg, err := json.Marshal(msg)
+	if err != nil {
+		fmt.Printf("Error al serializar el mensaje: %v\n", err)
+		return
+	}
+
+	// Asegúrate de que el mensaje termine con un salto de línea para que ReadBytes('\n') funcione
+	_, err = conn.Write(append(jsonMsg, '\n'))
+	if err != nil {
+		fmt.Printf("Error al enviar el mensaje al nodo %d: %v\n", targetID, err)
+	}
+}
+
+// ListenForMessages debe ser una goroutine que escuche mensajes entrantes.
+func ListenForMessages(node *ServerNodeWrapper, listenAddr string) {
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		fmt.Printf("Error al iniciar el listener en %s: %v\n", listenAddr, err)
+		return
+	}
+	defer listener.Close()
+	fmt.Printf("Nodo %d escuchando en %s\n", node.NodeID, listenAddr)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			// Manejar el error de conexión si el listener se cierra o hay problemas de red
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				fmt.Printf("Nodo %d: Error de timeout al aceptar conexión: %v\n", node.NodeID, err)
+				continue
+			}
+			if opErr, ok := err.(*net.OpError); ok && opErr.Op == "accept" && opErr.Net == "tcp" && opErr.Err.Error() == "use of closed network connection" {
+				// El listener fue cerrado intencionalmente
+				fmt.Printf("Nodo %d: Listener cerrado.\n", node.NodeID)
+				return
+			}
+			fmt.Printf("Nodo %d: Error al aceptar conexión: %v\n", node.NodeID, err)
+			continue
+		}
+		go handleConnection(conn, node)
+	}
+}
+
+func handleConnection(conn net.Conn, node *ServerNodeWrapper) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Leer hasta el delimitador de nueva línea
+	messageBytes, err := reader.ReadBytes('\n')
+	if err != nil {
+		fmt.Printf("Nodo %d: Error al leer del cliente %s: %v\n", node.NodeID, conn.RemoteAddr(), err)
+		return
+	}
+
+	var msg servernode.Message
+	err = json.Unmarshal(messageBytes, &msg)
+	if err != nil {
+		fmt.Printf("Nodo %d: Error al deserializar el mensaje de %s (%s): %v\n", node.NodeID, conn.RemoteAddr(), string(messageBytes), err)
+		return
+	}
+
+	// Enviar el mensaje al canal de entrada del nodo para procesamiento asíncrono
+	select {
+	case node.InboundMessages <- msg:
+		// Mensaje enviado al canal
+	default:
+		fmt.Printf("Nodo %d: Canal de mensajes lleno, descartando mensaje de %s\n", node.NodeID, msg.SenderID)
 	}
 }
 
 func main() {
-	// Para ejecutar, usar: go run main.go
-	// No se necesita <nodeID> como argumento de línea de comandos en esta simulación centralizada.
-	// Los nodos se inicializan en el main.
-	nodeIDs := []int{1, 2, 3}
-	nodes := make(map[int]*ServerNodeWrapper)
-
-	// Inicializar y iniciar todos los nodos
-	for _, id := range nodeIDs {
-		nodes[id] = NewServerNodeWrapper(id, nodeIDs)
-		go nodes[id].Start(nodes)
+	if len(os.Args) < 2 {
+		fmt.Println("Uso: go run main.go <node_id>")
+		fmt.Println(" o: ./server_node <node_id>")
+		return
 	}
 
-	// Sobrescribir los métodos de envío simulados en los módulos de cada nodo
-	for _, node := range nodes {
-		node.CoordinatorMod.SendElectionMessage = func(targetID int) bool {
-			SimulateSendMessage(node.NodeID, targetID, servernode.MessageTypeElection, "", nodes)
-			time.Sleep(50 * time.Millisecond) // Pequeño delay para simular latencia
-			return true
-		}
-
-		node.CoordinatorMod.SendOKMessage = func(targetID int) {
-			SimulateSendMessage(node.NodeID, targetID, servernode.MessageTypeOK, "", nodes)
-		}
-
-		node.CoordinatorMod.SendCoordinatorMessage = func(targetID, coordinatorID int) {
-			SimulateSendMessage(node.NodeID, targetID, servernode.MessageTypeCoordinator, strconv.Itoa(coordinatorID), nodes)
-		}
-
-		// Sobrescribir métodos de sincronización
-		node.SyncMod.SendRequestStateMessage = func(targetID int, payload string) {
-			SimulateSendMessage(node.NodeID, targetID, servernode.MessageTypeRequestState, payload, nodes)
-		}
-		node.SyncMod.SendStateMessage = func(targetID int, state servernode.Estado) {
-			stateJSON, _ := json.Marshal(state)
-			SimulateSendMessage(node.NodeID, targetID, servernode.MessageTypeSendState, string(stateJSON), nodes)
-		}
-		node.SyncMod.SendLogEntriesMessage = func(targetID int, entries []servernode.Evento, newSequenceNumber int) {
-			payloadData := struct {
-				Entries        []servernode.Evento `json:"entries"`
-				SequenceNumber int                 `json:"sequence_number"`
-			}{
-				Entries:        entries,
-				SequenceNumber: newSequenceNumber,
-			}
-			payloadJSON, _ := json.Marshal(payloadData)
-			SimulateSendMessage(node.NodeID, targetID, servernode.MessageTypeSendLog, string(payloadJSON), nodes)
-		}
-
-		// Sobrescribir métodos de monitoreo (SendHeartbeat)
-		node.MonitorMod.SendHeartbeat = func(targetID int) bool {
-			SimulateSendMessage(node.NodeID, targetID, servernode.MessageTypeAreYouAlive, "", nodes)
-			time.Sleep(100 * time.Millisecond) // Dar tiempo para que el mensaje se procese
-			if targetNode, ok := nodes[targetID]; ok && !targetNode.IsStopped {
-				return true // Simula que el primario está vivo
-			}
-			return false // Simula que el primario ha caído
-		}
+	nodeID, err := strconv.Atoi(os.Args[1])
+	if err != nil {
+		fmt.Println("El ID del nodo debe ser un número entero.")
+		return
 	}
 
-	time.Sleep(2 * time.Second)
-	fmt.Println("-------------------------------------------")
-	fmt.Printf("Estado inicial: Nodo 1 es el primario.\n")
-	fmt.Println("-------------------------------------------")
+	// Definimos las IPs y puertos de todos los nodos.
+	// Esto se debe mantener consistente en todas las instancias de main.go
+	nodeAddresses := map[int]string{
+		1: "10.10.28.17:8001",
+		2: "10.10.28.18:8001",
+		3: "10.10.28.19:8001",
+	}
 
-	time.Sleep(5 * time.Second) // Dar tiempo para que el primario genere eventos y los replique
+	nodeIDs := []int{1, 2, 3} // Todos los IDs de los nodos.
 
-	// Simular la caída del primario (Nodo 1)
-	fmt.Println("\n--- Simulando caída del Nodo 1 (primario) ---")
-	nodes[1].Stop() // Detener el nodo 1
-	time.Sleep(1 * time.Second)
+	// Verifica que el nodeID proporcionado sea válido
+	if _, ok := nodeAddresses[nodeID]; !ok {
+		fmt.Printf("Node ID %d no es válido. Debe ser 1, 2 o 3.\n", nodeID)
+		return
+	}
 
-	fmt.Println("\n--- Nodo 2 debería detectar la caída e iniciar elección ---")
-	time.Sleep(10 * time.Second) // Dar tiempo para que la elección y sincronización se completen
+	// Inicialización del nodo actual
+	node := NewServerNodeWrapper(nodeID, nodeIDs)
 
-	fmt.Println("\n--- Estado final de los nodos activos ---")
-	for _, id := range nodeIDs {
-		if node, ok := nodes[id]; ok && !node.IsStopped {
-			fmt.Printf("Nodo %d: Es primario = %t, Primario conocido = %d, Secuencia: %d, Eventos: %d\n",
-				node.NodeID, node.NodeState.IsPrimary, node.CoordinatorMod.PrimaryID, node.CurrentState.SequenceNumber, len(node.CurrentState.EventLog))
+	// Redefinir las funciones de envío de mensajes de los módulos para usar la red real
+	node.CoordinatorMod.SendElectionMessage = func(targetID int) bool {
+		fmt.Printf("Nodo %d: Enviando ELECTION a Nodo %d\n", node.NodeID, targetID)
+		SendMessageOverNetwork(node.NodeID, targetID, servernode.MessageTypeElection, "", nodeAddresses)
+		// Para una elección real, necesitarías esperar una respuesta 'OK' en un tiempo límite.
+		// Aquí, para simplificar, asumimos que el envío es "exitoso" para el propósito del algoritmo.
+		// El módulo de coordinación manejará los timeouts si no recibe OK.
+		return true // Asume que el mensaje fue intentado enviar
+	}
+
+	node.CoordinatorMod.SendOKMessage = func(targetID int) {
+		fmt.Printf("Nodo %d: Enviando OK a Nodo %d\n", node.NodeID, targetID)
+		SendMessageOverNetwork(node.NodeID, targetID, servernode.MessageTypeOK, "", nodeAddresses)
+	}
+
+	node.CoordinatorMod.SendCoordinatorMessage = func(targetID, coordinatorID int) {
+		payloadData := struct {
+			CoordinatorID int `json:"coordinator_id"`
+		}{
+			CoordinatorID: coordinatorID,
 		}
+		payloadJSON, _ := json.Marshal(payloadData)
+		fmt.Printf("Nodo %d: Enviando COORDINATOR (nuevo primario %d) a Nodo %d\n", node.NodeID, coordinatorID, targetID)
+		SendMessageOverNetwork(node.NodeID, targetID, servernode.MessageTypeCoordinator, string(payloadJSON), nodeAddresses)
 	}
 
-	// Simular la reintegración del Nodo 1
-	fmt.Println("\n--- Simulando reintegración del Nodo 1 ---")
-	nodes[1] = NewServerNodeWrapper(1, nodeIDs) // Crear una nueva instancia para simular re-inicio
-	go nodes[1].Start(nodes)
+	node.SyncMod.SendRequestStateMessage = func(targetID int, payload string) {
+		fmt.Printf("Nodo %d: Enviando REQUEST_STATE a Nodo %d\n", node.NodeID, targetID)
+		SendMessageOverNetwork(node.NodeID, targetID, servernode.MessageTypeRequestState, payload, nodeAddresses)
+	}
 
-	// Volver a sobrescribir los métodos de envío para el nodo 1 recién reintegrado
-	nodes[1].CoordinatorMod.SendElectionMessage = func(targetID int) bool {
-		SimulateSendMessage(nodes[1].NodeID, targetID, servernode.MessageTypeElection, "", nodes)
-		time.Sleep(50 * time.Millisecond)
-		return true
-	}
-	nodes[1].CoordinatorMod.SendOKMessage = func(targetID int) {
-		SimulateSendMessage(nodes[1].NodeID, targetID, servernode.MessageTypeOK, "", nodes)
-	}
-	nodes[1].CoordinatorMod.SendCoordinatorMessage = func(targetID, coordinatorID int) {
-		SimulateSendMessage(nodes[1].NodeID, targetID, servernode.MessageTypeCoordinator, strconv.Itoa(coordinatorID), nodes)
-	}
-	nodes[1].SyncMod.SendRequestStateMessage = func(targetID int, payload string) {
-		SimulateSendMessage(nodes[1].NodeID, targetID, servernode.MessageTypeRequestState, payload, nodes)
-	}
-	nodes[1].SyncMod.SendStateMessage = func(targetID int, state servernode.Estado) {
+	node.SyncMod.SendStateMessage = func(targetID int, state servernode.Estado) {
 		stateJSON, _ := json.Marshal(state)
-		SimulateSendMessage(nodes[1].NodeID, targetID, servernode.MessageTypeSendState, string(stateJSON), nodes)
+		fmt.Printf("Nodo %d: Enviando SEND_STATE a Nodo %d\n", node.NodeID, targetID)
+		SendMessageOverNetwork(node.NodeID, targetID, servernode.MessageTypeSendState, string(stateJSON), nodeAddresses)
 	}
-	nodes[1].SyncMod.SendLogEntriesMessage = func(targetID int, entries []servernode.Evento, newSequenceNumber int) {
+
+	node.SyncMod.SendLogEntriesMessage = func(targetID int, entries []servernode.Evento, newSequenceNumber int) {
 		payloadData := struct {
 			Entries        []servernode.Evento `json:"entries"`
 			SequenceNumber int                 `json:"sequence_number"`
@@ -332,33 +345,39 @@ func main() {
 			SequenceNumber: newSequenceNumber,
 		}
 		payloadJSON, _ := json.Marshal(payloadData)
-		SimulateSendMessage(nodes[1].NodeID, targetID, servernode.MessageTypeSendLog, string(payloadJSON), nodes)
-	}
-	nodes[1].MonitorMod.SendHeartbeat = func(targetID int) bool {
-		SimulateSendMessage(nodes[1].NodeID, targetID, servernode.MessageTypeAreYouAlive, "", nodes)
-		time.Sleep(100 * time.Millisecond)
-		if targetNode, ok := nodes[targetID]; ok && !targetNode.IsStopped {
-			return true
-		}
-		return false
+		fmt.Printf("Nodo %d: Enviando SEND_LOG a Nodo %d\n", node.NodeID, targetID)
+		SendMessageOverNetwork(node.NodeID, targetID, servernode.MessageTypeSendLog, string(payloadJSON), nodeAddresses)
 	}
 
-
-	time.Sleep(5 * time.Second) // Dar tiempo para que el nodo 1 se reintegre y sincronice
-
-	fmt.Println("\n--- Estado de los nodos después de la reintegración del Nodo 1 ---")
-	for _, id := range nodeIDs {
-		if node, ok := nodes[id]; ok && !node.IsStopped {
-			fmt.Printf("Nodo %d: Es primario = %t, Primario conocido = %d, Secuencia: %d, Eventos: %d\n",
-				node.NodeID, node.NodeState.IsPrimary, node.CoordinatorMod.PrimaryID, node.CurrentState.SequenceNumber, len(node.CurrentState.EventLog))
-		}
+	node.MonitorMod.SendHeartbeat = func(targetID int) bool {
+		fmt.Printf("Nodo %d: Enviando ARE_YOU_ALIVE a Nodo %d\n", node.NodeID, targetID)
+		SendMessageOverNetwork(node.NodeID, targetID, servernode.MessageTypeAreYouAlive, "", nodeAddresses)
+		// Para un heartbeat real, esperarías una respuesta "OK" en un tiempo límite.
+		// La lógica de `MonitorModule` ya espera esta respuesta indirectamente (si no hay OK, asume caído).
+		return true // Asume que el intento de envío es exitoso.
 	}
 
-	time.Sleep(5 * time.Second) // Mantener la aplicación en ejecución para ver logs
+	// Iniciar el listener de mensajes para este nodo en su dirección IP y puerto
+	go ListenForMessages(node, nodeAddresses[nodeID])
 
-	// Detener todos los nodos al final
-	fmt.Println("\n--- Deteniendo todos los nodos ---")
-	for _, node := range nodes {
-		node.Stop()
+	// Iniciar los módulos del nodo
+	node.Start()
+
+	// --- Lógica de la simulación principal (para el nodo primario) ---
+	// Esta parte de la lógica es solo para simular la adición de eventos en el primario.
+	// En un sistema real, un cliente externo o una aplicación dispararía estas acciones.
+	if nodeID == 1 { // Suponemos que el nodo 1 es el primario inicial y el que añade eventos.
+		fmt.Println("\n--- Nodo 1 (Primario Inicial): Esperando a que el sistema se estabilice para añadir eventos ---")
+		time.Sleep(10 * time.Second) // Dar tiempo para que los nodos arranquen y elijan primario
+
+		fmt.Println("\n--- Nodo 1 (Posible Primario): Agregando eventos ---")
+		node.SyncMod.AddEvent(servernode.Evento{ID: 1, Value: "primer evento"})
+		time.Sleep(1 * time.Second)
+		node.SyncMod.AddEvent(servernode.Evento{ID: 2, Value: "segundo evento"})
+		time.Sleep(1 * time.Second)
+		node.SyncMod.AddEvent(servernode.Evento{ID: 3, Value: "tercer evento"})
 	}
+
+	// Mantener el nodo corriendo indefinidamente
+	select {}
 }

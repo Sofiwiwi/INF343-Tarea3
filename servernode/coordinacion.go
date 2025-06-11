@@ -4,30 +4,33 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"sort"
 	"os"
-	//"strconv"
+	"sort"
 	"sync"
 	"time"
 )
 
 const (
-	MessageTypeElection   = "ELECTION"
+	MessageTypeElection    = "ELECTION"
 	MessageTypeCoordinator = "COORDINATOR"
 	MessageTypeAreYouAlive = "ARE_YOU_ALIVE"
-	MessageTypeOK          = "OK"
+	MessageTypeOK          = "OK" // Mensaje de respuesta a ELECTION y ARE_YOU_ALIVE
 )
 
 // CoordinatorModule es la estructura para el módulo de coordinación
 type CoordinatorModule struct {
-	NodeID          int
-	Nodes           []int // IDs de todos los nodos conocidos en el sistema (necesario para el algoritmo del matón)
-	IsPrimary       bool
-	PrimaryID       int
-	ElectionLock    sync.Mutex // Para evitar múltiples elecciones simultáneas
-	ElectionRunning bool
-	NodeState       *Nodo // Referencia al estado del propio nodo
-	// Funciones simuladas para enviar mensajes
+	NodeID           int
+	Nodes            []int // IDs de todos los nodos conocidos en el sistema (necesario para el algoritmo del matón)
+	IsPrimary        bool
+	PrimaryID        int // ID del nodo primario conocido
+	ElectionLock     sync.Mutex
+	ElectionRunning  bool
+	NodeState        *Nodo         // Referencia al estado del propio nodo
+	PrimaryLastSeen  time.Time     // Última vez que se recibió un mensaje (heartbeat/OK) del primario
+	PrimaryTimeout   time.Duration // Tiempo de espera para considerar al primario caído
+	LastElectionTime time.Time     // Para evitar elecciones muy seguidas
+
+	// Funciones que deben ser inyectadas por el entorno de ejecución (main.go)
 	SendElectionMessage    func(targetID int) bool
 	SendOKMessage          func(targetID int)
 	SendCoordinatorMessage func(targetID, coordinatorID int)
@@ -35,69 +38,166 @@ type CoordinatorModule struct {
 
 // NewCoordinatorModule crea una nueva instancia del módulo de coordinación
 func NewCoordinatorModule(nodeID int, allNodes []int, nodeState *Nodo) *CoordinatorModule {
-	// Asegúrate de que allNodes esté ordenado para facilitar la elección
-	sort.Ints(allNodes)
-	return &CoordinatorModule{
-		NodeID:    nodeID,
-		Nodes:     allNodes,
-		IsPrimary: false, // Inicialmente, no es primario
-		PrimaryID: -1,    // ID desconocido al inicio
-		NodeState: nodeState,
+	sort.Ints(allNodes) // Asegúrate de que allNodes esté ordenado para facilitar la elección
+	cm := &CoordinatorModule{
+		NodeID:           nodeID,
+		Nodes:            allNodes,
+		IsPrimary:        nodeState.IsPrimary, // Carga el estado de primario desde la persistencia
+		PrimaryID:        -1,                  // ID desconocido al inicio
+		NodeState:        nodeState,
+		PrimaryTimeout:   5 * time.Second, // 5 segundos para considerar al primario caído
+		PrimaryLastSeen:  time.Now(),      // Inicializa con el tiempo actual
+		LastElectionTime: time.Unix(0, 0), // Inicializa a un tiempo muy antiguo
 	}
+	// Si se carga el estado y era primario, asumirlo de nuevo
+	if nodeState.IsPrimary {
+		cm.IsPrimary = true
+		cm.PrimaryID = nodeID
+		fmt.Printf("Nodo %d: Cargado como primario desde persistencia.\n", nodeID)
+	}
+	return cm
 }
 
-// StartElection inicia el algoritmo del matón
+// StartElection inicia el algoritmo del matón.
 func (cm *CoordinatorModule) StartElection() {
 	cm.ElectionLock.Lock()
 	defer cm.ElectionLock.Unlock()
 
+	// Evitar iniciar una nueva elección si ya hay una en curso o si se acaba de hacer una
 	if cm.ElectionRunning {
-		fmt.Printf("Nodo %d: Ya hay una elección en curso. Ignorando solicitud.\n", cm.NodeID)
+		fmt.Printf("Nodo %d: Elección ya en curso. No iniciar de nuevo.\n", cm.NodeID)
+		return
+	}
+	if time.Since(cm.LastElectionTime) < 2*time.Second { // No iniciar elección si una terminó hace poco
+		fmt.Printf("Nodo %d: Elección reciente. Esperando antes de iniciar otra.\n", cm.NodeID)
 		return
 	}
 
-	fmt.Printf("Nodo %d: El primario %d ha caído o no responde. Iniciando elección.\n", cm.NodeID, cm.PrimaryID)
 	cm.ElectionRunning = true
-	cm.IsPrimary = false
-	cm.NodeState.IsPrimary = false
+	cm.PrimaryID = -1 // Resetear el primario conocido al iniciar elección
+	cm.LastElectionTime = time.Now()
 
-	higherNodes := cm.getHigherIDNodes()
+	fmt.Printf("Nodo %d: Iniciando elección...\n", cm.NodeID)
 
-	if len(higherNodes) == 0 {
-		cm.declareSelfAsCoordinator()
-		return
+	higherNodesResponded := false
+	for _, targetID := range cm.Nodes {
+		if targetID > cm.NodeID {
+			fmt.Printf("Nodo %d: Enviando ELECTION a %d\n", cm.NodeID, targetID)
+			// SendElectionMessage debe esperar una respuesta OK
+			if cm.SendElectionMessage(targetID) {
+				// En un sistema real, esperaríamos el mensaje OK y lo procesaríamos en HandleOKMessage.
+				// Para este modelo, si SendElectionMessage devuelve true, simulamos que responde OK.
+				// Pero la lógica de detección de "OK" de un nodo superior es más compleja con la red.
+				// El algoritmo del matón dice que si alguien *más alto* responde, se cede.
+				higherNodesResponded = true
+				break // Un nodo con ID más alto respondió, se cede la elección
+			}
+		}
 	}
 
-	fmt.Printf("Nodo %d: Enviando mensajes de elección a nodos con ID superior: %v\n", cm.NodeID, higherNodes)
-	respondedOK := make(chan bool, len(higherNodes))
-
-	for _, targetID := range higherNodes {
-		go func(targetID int) {
-			// Usar el campo de función aquí
-			ok := cm.SendElectionMessage(targetID) //
-			respondedOK <- ok
-		}(targetID)
-	}
-	// Esperar respuestas de los nodos superiores
-	select {
-	case <-time.After(2 * time.Second): // Esperar un tiempo por las respuestas
-		fmt.Printf("Nodo %d: Timeout esperando respuestas OK. Asumiendo que no hay nodos de mayor ID activos.\n", cm.NodeID)
-		if !cm.ElectionRunning { // Si la elección ya terminó por otro mensaje, no hacer nada
-			return
-		}
-		cm.declareSelfAsCoordinator()
-	case ok := <-respondedOK:
-		if ok {
-			fmt.Printf("Nodo %d: Recibido OK de un nodo superior. Esperando mensaje de coordinador.\n", cm.NodeID)
-			cm.ElectionRunning = false // Termina su rol en esta elección, espera al coordinador.
-		} else {
-			fmt.Printf("Nodo %d: No se recibió OK de un nodo superior (o el envío falló). Esto no debería suceder en la simulación si los nodos están activos.\n", cm.NodeID)
-		}
+	if higherNodesResponded {
+		fmt.Printf("Nodo %d: Nodo con ID más alto respondió. Esperando mensaje COORDINATOR.\n", cm.NodeID)
+		// Esperar por un mensaje COORDINATOR por un tiempo
+		go func() {
+			time.Sleep(5 * time.Second) // Dar tiempo al nuevo coordinador para anunciarse
+			cm.ElectionLock.Lock()
+			defer cm.ElectionLock.Unlock()
+			if cm.PrimaryID == -1 { // Si no se ha anunciado un coordinador después del tiempo de espera
+				fmt.Printf("Nodo %d: No se recibió mensaje COORDINATOR. Reiniciando elección.\n", cm.NodeID)
+				cm.ElectionRunning = false // Permitir nueva elección
+				cm.StartElection()         // Reintentar
+			} else {
+				cm.ElectionRunning = false
+			}
+		}()
+	} else {
+		// Nadie con ID más alto respondió, este nodo es el nuevo primario
+		cm.IsPrimary = true
+		cm.PrimaryID = cm.NodeID
+		cm.NodeState.IsPrimary = true // Actualizar estado persistente del nodo
+		cm.NodeState.SaveNodeStateToFile()
+		fmt.Printf("Nodo %d: ¡Soy el nuevo primario!\n", cm.NodeID)
+		cm.ElectionRunning = false
+		cm.AnnounceCoordinator()
 	}
 }
 
+// AnnounceCoordinator anuncia el nuevo primario a todos los demás nodos.
+func (cm *CoordinatorModule) AnnounceCoordinator() {
+	cm.ElectionLock.Lock()
+	defer cm.ElectionLock.Unlock()
+
+	fmt.Printf("Nodo %d (Primario): Anunciando que soy el primario (%d) a todos los demás nodos.\n", cm.NodeID, cm.NodeID)
+	for _, targetID := range cm.Nodes {
+		if targetID != cm.NodeID {
+			cm.SendCoordinatorMessage(targetID, cm.NodeID)
+		}
+	}
+	cm.PrimaryLastSeen = time.Now() // El primario se "ve" a sí mismo
+}
+
+// HandleElectionMessage procesa un mensaje ELECTION recibido.
+func (cm *CoordinatorModule) HandleElectionMessage(senderID int) {
+	cm.ElectionLock.Lock()
+	defer cm.ElectionLock.Unlock()
+
+	fmt.Printf("Nodo %d: Recibió ELECTION de %d.\n", cm.NodeID, senderID)
+
+	// Responder OK al nodo que envió la elección
+	cm.SendOKMessage(senderID)
+
+	// Si este nodo tiene un ID más alto, inicia su propia elección si no hay una en curso.
+	if cm.NodeID > senderID && !cm.ElectionRunning {
+		fmt.Printf("Nodo %d: Soy más alto que %d. Iniciando mi propia elección.\n", cm.NodeID, senderID)
+		go cm.StartElection() // Iniciar en una goroutine para no bloquear el procesamiento de mensajes
+	} else if cm.NodeID > senderID && cm.ElectionRunning {
+		fmt.Printf("Nodo %d: Soy más alto que %d, pero ya hay una elección en curso (liderada por mí o uno superior).\n", cm.NodeID, senderID)
+	}
+}
+
+// HandleOKMessage procesa un mensaje OK recibido.
+func (cm *CoordinatorModule) HandleOKMessage(senderID int) {
+	cm.ElectionLock.Lock()
+	defer cm.ElectionLock.Unlock()
+
+	fmt.Printf("Nodo %d: Recibió OK de %d.\n", cm.NodeID, senderID)
+	// Si este nodo estaba en una elección y recibió un OK de un nodo de mayor ID,
+	// significa que ese nodo de mayor ID se hará cargo de la elección.
+	// Este nodo debe dejar de lado su propia elección y esperar a que el nuevo coordinador se anuncie.
+	if cm.ElectionRunning && senderID > cm.NodeID {
+		fmt.Printf("Nodo %d: Un nodo de mayor ID (%d) respondió OK. Desactivando mi elección y esperando nuevo coordinador.\n", cm.NodeID, senderID)
+		cm.ElectionRunning = false // Ceder la elección
+	}
+
+	// También usar el OK como una señal de vida, especialmente si el senderID es el primario actual
+	if senderID == cm.PrimaryID {
+		cm.PrimaryLastSeen = time.Now()
+		// fmt.Printf("Nodo %d: Actualizado PrimaryLastSeen para el primario %d.\n", cm.NodeID, cm.PrimaryID) // Descomentar para debug
+	}
+}
+
+// HandleCoordinatorMessage procesa un mensaje COORDINATOR recibido.
+func (cm *CoordinatorModule) HandleCoordinatorMessage(coordinatorID int) {
+	cm.ElectionLock.Lock()
+	defer cm.ElectionLock.Unlock()
+
+	fmt.Printf("Nodo %d: Recibió COORDINATOR de %d. Nuevo primario es %d.\n", cm.NodeID, coordinatorID, coordinatorID)
+	cm.PrimaryID = coordinatorID
+	cm.IsPrimary = (cm.NodeID == coordinatorID) // Actualiza si este nodo es el primario
+	cm.ElectionRunning = false                  // Terminar cualquier elección en curso
+
+	// Actualizar el estado persistente del nodo
+	cm.NodeState.IsPrimary = cm.IsPrimary
+	cm.NodeState.SaveNodeStateToFile()
+
+	// Si este nodo es un secundario y se acaba de elegir un nuevo primario,
+	// debería solicitar la sincronización de estado.
+	// Esto se manejará en main.go después de que el coordinador se anuncie.
+	cm.PrimaryLastSeen = time.Now() // El nuevo primario se acaba de anunciar
+}
 
 // getHigherIDNodes devuelve una lista de IDs de nodos con un ID mayor al propio.
+// Se ha movido aquí para estar con los métodos del módulo.
 func (cm *CoordinatorModule) getHigherIDNodes() []int {
 	var higherNodes []int
 	for _, id := range cm.Nodes {
@@ -108,80 +208,23 @@ func (cm *CoordinatorModule) getHigherIDNodes() []int {
 	return higherNodes
 }
 
-// HandleElectionMessage es llamado cuando el nodo recibe un mensaje de elección.
-func (cm *CoordinatorModule) HandleElectionMessage(senderID int) {
-	cm.ElectionLock.Lock()
-	defer cm.ElectionLock.Unlock()
-	fmt.Printf("Nodo %d: Recibido ELECTION de Nodo %d.\n", cm.NodeID, senderID)
-
-	if cm.NodeID > senderID {
-		fmt.Printf("Nodo %d: Mi ID es mayor que %d. Respondiendo OK.\n", cm.NodeID, senderID)
-		cm.SendOKMessage(senderID) 
-		if !cm.ElectionRunning {
-			go cm.StartElection() 
-		}
-	} else {
-		fmt.Printf("Nodo %d: Mi ID es menor que %d. No respondo OK, solo espero el coordinador.\n", cm.NodeID, senderID)
-	}
-}
-
-// HandleCoordinatorMessage es llamado cuando el nodo recibe un mensaje de coordinador.
-func (cm *CoordinatorModule) HandleCoordinatorMessage(coordinatorID int) {
-	cm.ElectionLock.Lock() // Proteger el estado durante la actualización del coordinador
-	defer cm.ElectionLock.Unlock()
-	fmt.Printf("Nodo %d: Recibido COORDINATOR de Nodo %d. El nuevo primario es %d.\n", cm.NodeID, coordinatorID, coordinatorID)
-	cm.PrimaryID = coordinatorID
-	cm.ElectionRunning = false 
-	if cm.NodeID == coordinatorID {
-		cm.IsPrimary = true
-		cm.NodeState.IsPrimary = true
-		fmt.Printf("Nodo %d: ¡Soy el nuevo primario!\n", cm.NodeID)
-		// Persistir el estado del nodo (incluyendo IsPrimary)
-		cm.NodeState.SaveNodeStateToFile()
-	} else {
-		cm.IsPrimary = false
-		cm.NodeState.IsPrimary = false
-		fmt.Printf("Nodo %d: El primario es %d.\n", cm.NodeID, coordinatorID)
-		// Persistir el estado del nodo (incluyendo IsPrimary)
-		cm.NodeState.SaveNodeStateToFile()
-	}
-}
-
 // declareSelfAsCoordinator se llama cuando el nodo se convierte en el coordinador.
+// Se ha movido aquí para estar con los métodos del módulo.
 func (cm *CoordinatorModule) declareSelfAsCoordinator() {
 	cm.IsPrimary = true
 	cm.PrimaryID = cm.NodeID
 	cm.ElectionRunning = false
-	cm.NodeState.IsPrimary = true // Actualizar el estado del propio nodo
+	cm.NodeState.IsPrimary = true      // Actualizar el estado del propio nodo
 	cm.NodeState.SaveNodeStateToFile() // Persistir el estado del nodo
 
 	fmt.Printf("Nodo %d: ¡Soy el nuevo coordinador/primario!\n", cm.NodeID)
 
 	for _, targetID := range cm.Nodes {
 		if targetID != cm.NodeID {
-			cm.SendCoordinatorMessage(targetID, cm.NodeID) //
+			cm.SendCoordinatorMessage(targetID, cm.NodeID) // Usar la función inyectada
 		}
 	}
 }
-
-/* Funciones default (son reescritas en el main.go)
-func (cm *CoordinatorModule) SendElectionMessage(targetID int) bool {
-	fmt.Printf("Nodo %d: Enviando ELECCIÓN a Nodo %d\n", cm.NodeID, targetID)
-	time.Sleep(500 * time.Millisecond) // Simula latencia de red
-	fmt.Printf("Nodo %d: Recibido OK de Nodo %d (simulado).\n", cm.NodeID, targetID)
-	return true // Asumimos que recibe OK
-}
-
-// SendOKMessage simula el envío de un mensaje OK.
-func (cm *CoordinatorModule) SendOKMessage(targetID int) {
-	fmt.Printf("Nodo %d: Enviando OK a Nodo %d\n", cm.NodeID, targetID)
-}
-
-// SendCoordinatorMessage simula el envío de un mensaje de coordinador.
-func (cm *CoordinatorModule) SendCoordinatorMessage(targetID, coordinatorID int) {
-	fmt.Printf("Nodo %d: Enviando COORDINATOR (nuevo primario %d) a Nodo %d\n", cm.NodeID, coordinatorID, targetID)
-}
-*/
 
 // SaveNodeStateToFile guarda el estado actual del nodo en un archivo JSON.
 // Esto es útil para la persistencia del estado (similar a lo que haría el módulo de persistencia).
@@ -195,6 +238,7 @@ func (n *Nodo) SaveNodeStateToFile() error {
 	if err != nil {
 		return fmt.Errorf("error al escribir el estado del nodo en el archivo %s: %w", fileName, err)
 	}
+	fmt.Printf("Nodo %d: Estado del nodo persistido en %s (Es primario: %t).\n", n.ID, fileName, n.IsPrimary)
 	return nil
 }
 
@@ -214,5 +258,6 @@ func LoadNodeStateFromFile(nodeID int) (*Nodo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error al deserializar el estado del nodo desde el archivo %s: %w", fileName, err)
 	}
+	fmt.Printf("Nodo %d: Estado del nodo cargado desde %s (Es primario: %t).\n", node.ID, fileName, node.IsPrimary)
 	return &node, nil
 }

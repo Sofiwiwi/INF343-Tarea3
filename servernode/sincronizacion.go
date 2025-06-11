@@ -2,7 +2,7 @@
 package servernode
 
 import (
-	//"encoding/json"
+	// Asegurado que esté importado para la consistencia del Message struct
 	"fmt"
 	"sync"
 )
@@ -16,13 +16,13 @@ const (
 )
 
 // Message representa un mensaje genérico entre nodos (copiado de coordinacion.go para no tener dependencia circular)
+// Se añaden las json tags para consistencia con el marshalling/unmarshalling en main.go
 type Message struct {
-	SenderID   int
-	TargetID   int
-	MessageType string
-	Payload    string
+	SenderID    int    `json:"sender_id"`
+	TargetID    int    `json:"target_id"`
+	MessageType string `json:"message_type"`
+	Payload     string `json:"payload"`
 }
-
 
 // SynchronizationModule es el módulo encargado de la sincronización del estado
 type SynchronizationModule struct {
@@ -33,6 +33,7 @@ type SynchronizationModule struct {
 	mu                sync.Mutex         // Mutex para proteger el estado durante la sincronización
 	PersistenceModule *PersistenceModule // Referencia al módulo de persistencia
 
+	// Funciones que deben ser inyectadas por el entorno de ejecución (main.go)
 	SendRequestStateMessage func(targetID int, payload string)
 	SendStateMessage        func(targetID int, state Estado)
 	SendLogEntriesMessage   func(targetID int, entries []Evento, newSequenceNumber int)
@@ -46,169 +47,68 @@ func NewSynchronizationModule(nodeID int, coordinator *CoordinatorModule, curren
 		CurrentState:      currentState,
 		NodeState:         nodeState,
 		PersistenceModule: persistence,
+		// Las funciones de envío se asignarán en main.go
 	}
 }
 
-// RequestStateFromPrimary solicita el estado completo o incremental al primario.
-// Este método se llamaría cuando un nodo se reintegra.
-func (sm *SynchronizationModule) RequestStateFromPrimary() {
+// HandleRequestStateMessage maneja un mensaje de solicitud de estado.
+// El primario debería responder con su estado completo. Los secundarios pueden redirigir o ignorar.
+func (sm *SynchronizationModule) HandleRequestStateMessage(senderID int) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if sm.Coordinator.PrimaryID == -1 || sm.Coordinator.PrimaryID == sm.NodeID {
-		fmt.Printf("Nodo %d: No se puede solicitar estado; no hay primario conocido o soy el primario.\n", sm.NodeID)
-		return
+	// Si este nodo es el primario, envía su estado completo
+	if sm.NodeState.IsPrimary {
+		fmt.Printf("Nodo %d (Primario): Recibida solicitud de estado de %d. Enviando estado actual (Seq: %d).\n", sm.NodeID, senderID, sm.CurrentState.SequenceNumber)
+		sm.SendStateMessage(senderID, *sm.CurrentState)
+	} else {
+		// Si no es el primario, puede que el solicitante no sepa quién es el primario
+		// O podría redirigir la solicitud al primario conocido.
+		fmt.Printf("Nodo %d (Secundario): Recibida solicitud de estado de %d, pero no soy primario. Primario conocido: %d.\n", sm.NodeID, senderID, sm.Coordinator.PrimaryID)
+		// Opcional: Podríamos enviar un mensaje al senderID diciéndole quién es el primario
+		// Esto dependerá del protocolo de comunicación deseado.
 	}
-
-	fmt.Printf("Nodo %d: Solicitando estado al primario %d. Mi secuencia actual: %d\n", sm.NodeID, sm.Coordinator.PrimaryID, sm.CurrentState.SequenceNumber)
-
-	// Simular el envío del mensaje de solicitud de estado
-	// El payload puede incluir el SequenceNumber del nodo que solicita para una sincronización incremental
-	requestPayload := fmt.Sprintf("%d", sm.CurrentState.SequenceNumber) // Envía el último SequenceNumber conocido
-	sm.SendRequestStateMessage(sm.Coordinator.PrimaryID, requestPayload)
 }
 
-// ApplyState aplica el estado recibido del primario.
-// Esto se usa para una sincronización completa.
-func (sm *SynchronizationModule) ApplyState(newState Estado) {
+// UpdateState actualiza el estado replicado de este nodo con el estado recibido de otro nodo (usualmente el primario).
+func (sm *SynchronizationModule) UpdateState(newState *Estado) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	// Solo aplica el estado si el sequence number del nuevo estado es mayor
+	// Solo actualiza si el estado recibido es más reciente
 	if newState.SequenceNumber > sm.CurrentState.SequenceNumber {
-		sm.CurrentState.SequenceNumber = newState.SequenceNumber
-		sm.CurrentState.EventLog = newState.EventLog
-		fmt.Printf("Nodo %d: Estado actualizado completamente. Nuevo SequenceNumber: %d, EventLog tamaño: %d\n",
-			sm.NodeID, sm.CurrentState.SequenceNumber, len(sm.CurrentState.EventLog))
-		// Después de aplicar el estado, es importante persistirlo.
-		sm.PersistenceModule.SaveState(sm.CurrentState) // <-- LLAMADA AL MÓDULO DE PERSISTENCIA
+		sm.CurrentState = newState
+		fmt.Printf("Nodo %d: Estado actualizado a SequenceNumber %d. Eventos: %d.\n", sm.NodeID, sm.CurrentState.SequenceNumber, len(sm.CurrentState.EventLog))
+		// Persistir el estado después de actualizarlo
+		sm.PersistenceModule.SaveState(sm.CurrentState)
 	} else {
-		fmt.Printf("Nodo %d: Estado recibido con SequenceNumber %d no es más nuevo que el actual %d. Ignorando.\n",
-			sm.NodeID, newState.SequenceNumber, sm.CurrentState.SequenceNumber)
+		fmt.Printf("Nodo %d: Recibido estado con SequenceNumber %d, pero el local es %d. No se actualiza.\n", sm.NodeID, newState.SequenceNumber, sm.CurrentState.SequenceNumber)
 	}
 }
 
-// ApplyLogEntries aplica entradas de log incrementales.
-// Esto se usa para una sincronización incremental (el BONUS).
-func (sm *SynchronizationModule) ApplyLogEntries(entries []Evento, newSequenceNumber int) {
+// ReconcileStateWithPrimary solicita el estado completo al primario.
+func (sm *SynchronizationModule) ReconcileStateWithPrimary() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	// Asegurarse de que las entradas sean realmente nuevas
-	if newSequenceNumber > sm.CurrentState.SequenceNumber {
-		for _, entry := range entries {
-			// Evitar duplicados si las entradas ya están en el log local (puede ocurrir en reintentos)
-			found := false
-			for _, existingEntry := range sm.CurrentState.EventLog {
-				if existingEntry.ID == entry.ID { // Asumiendo que ID de Evento es único
-					found = true
-					break
-				}
-			}
-			if !found {
-				sm.CurrentState.EventLog = append(sm.CurrentState.EventLog, entry)
-			}
-		}
-		sm.CurrentState.SequenceNumber = newSequenceNumber
-		fmt.Printf("Nodo %d: Estado actualizado incrementalmente. Nuevo SequenceNumber: %d, EventLog tamaño: %d\n",
-			sm.NodeID, sm.CurrentState.SequenceNumber, len(sm.CurrentState.EventLog))
-		sm.PersistenceModule.SaveState(sm.CurrentState) // <-- LLAMADA AL MÓDULO DE PERSISTENCIA
-	} else {
-		fmt.Printf("Nodo %d: Entradas de log recibidas con SequenceNumber %d no son más nuevas que el actual %d. Ignorando.\n",
-			sm.NodeID, newSequenceNumber, sm.CurrentState.SequenceNumber)
-	}
-}
-
-// --- Métodos de Simulación de Comunicación (serían redefinidos en main.go) ---
-/*
-// SendRequestStateMessage simula el envío de una solicitud de estado.
-func (sm *SynchronizationModule) SendRequestStateMessage(targetID int, payload string) {
-	fmt.Printf("Nodo %d: Enviando REQUEST_STATE (mi secuencia: %s) a Nodo %d\n", sm.NodeID, payload, targetID)
-}
-
-// SendStateMessage simula el envío del estado completo.
-func (sm *SynchronizationModule) SendStateMessage(targetID int, state Estado) {
-	_, err := json.Marshal(state)
-	if err != nil {
-		fmt.Printf("Error al serializar estado para envío: %v\n", err)
-		return
-	}
-	fmt.Printf("Nodo %d: Enviando SEND_STATE (seq: %d) a Nodo %d\n", sm.NodeID, state.SequenceNumber, targetID)
-}
-
-// SendLogEntriesMessage simula el envío de entradas de log incrementales.
-func (sm *SynchronizationModule) SendLogEntriesMessage(targetID int, entries []Evento, newSequenceNumber int) {
-	payloadData := struct {
-		Entries        []Evento `json:"entries"`
-		SequenceNumber int      `json:"sequence_number"`
-	}{
-		Entries:        entries,
-		SequenceNumber: newSequenceNumber,
-	}
-	_, err := json.Marshal(payloadData)
-	if err != nil {
-		fmt.Printf("Error al serializar entradas de log para envío: %v\n", err)
-		return
-	}
-	fmt.Printf("Nodo %d: Enviando SEND_LOG (seq: %d, %d entradas) a Nodo %d\n", sm.NodeID, newSequenceNumber, len(entries), targetID)
-}
-*/
-// --- Métodos que serían llamados por el enrutador de mensajes (main.go) ---
-
-// HandleRequestStateMessage es llamado cuando el primario recibe una solicitud de estado.
-func (sm *SynchronizationModule) HandleRequestStateMessage(requesterID int, currentSequence int) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	if !sm.Coordinator.IsPrimary {
-		fmt.Printf("Nodo %d: Recibido REQUEST_STATE de Nodo %d, pero no soy el primario. Ignorando.\n", sm.NodeID, requesterID)
+	if sm.NodeState.IsPrimary {
+		fmt.Printf("Nodo %d: No necesita reconciliar, es el primario.\n", sm.NodeID)
 		return
 	}
 
-	fmt.Printf("Nodo %d (Primario): Recibido REQUEST_STATE de Nodo %d. Secuencia del solicitante: %d. Mi secuencia: %d\n",
-		sm.NodeID, requesterID, currentSequence, sm.CurrentState.SequenceNumber)
-
-	// Implementación del BONUS: enviar solo los logs faltantes
-	if currentSequence < sm.CurrentState.SequenceNumber {
-		var entriesToSend []Evento
-		for _, event := range sm.CurrentState.EventLog {
-			// Asumiendo que el currentSequence del solicitante se refiere al ID del último evento conocido
-			// o un índice de log. Para una implementación robusta, el SequenceNumber es clave.
-			// Aquí, filtramos por el SequenceNumber, si los eventos tienen SequenceNumber o si el ID es incremental.
-			// Si el ID del evento es incremental y representa el SequenceNumber de ese evento:
-			if event.ID > currentSequence {
-				entriesToSend = append(entriesToSend, event)
-			}
-		}
-
-		if len(entriesToSend) > 0 {
-			fmt.Printf("Nodo %d (Primario): Enviando %d entradas de log a Nodo %d.\n", sm.NodeID, len(entriesToSend), requesterID)
-			sm.SendLogEntriesMessage(requesterID, entriesToSend, sm.CurrentState.SequenceNumber)
-		} else {
-			fmt.Printf("Nodo %d (Primario): Nodo %d ya tiene el estado más reciente, o no hay entradas nuevas. Enviando estado completo si es necesario.\n", sm.NodeID, requesterID)
-			sm.SendStateMessage(requesterID, *sm.CurrentState)
-		}
-	} else {
-		// Si la secuencia del solicitante es igual o mayor, o si simplemente quieres enviar el estado completo.
-		fmt.Printf("Nodo %d (Primario): Enviando estado COMPLETO a Nodo %d (secuencia solicitante %d >= mi secuencia %d).\n", sm.NodeID, requesterID, currentSequence, sm.CurrentState.SequenceNumber)
-		sm.SendStateMessage(requesterID, *sm.CurrentState)
+	primaryID := sm.Coordinator.PrimaryID
+	if primaryID == -1 {
+		fmt.Printf("Nodo %d: No hay primario conocido para reconciliar. Esperando elección.\n", sm.NodeID)
+		return
 	}
+
+	fmt.Printf("Nodo %d: Solicitando estado completo al primario %d...\n", sm.NodeID, primaryID)
+	// Envía un mensaje pidiendo el estado completo al primario
+	sm.SendRequestStateMessage(primaryID, "")
 }
 
-// HandleReceiveState es llamado cuando un nodo recibe un estado completo del primario.
-func (sm *SynchronizationModule) HandleReceiveState(newState Estado) {
-	fmt.Printf("Nodo %d: Recibido estado COMPLETO de primario (seq: %d).\n", sm.NodeID, newState.SequenceNumber)
-	sm.ApplyState(newState)
-}
-
-// HandleReceiveLogEntries es llamado cuando un nodo recibe entradas de log incrementales.
-func (sm *SynchronizationModule) HandleReceiveLogEntries(entries []Evento, newSequenceNumber int) {
-	fmt.Printf("Nodo %d: Recibido %d entradas de log incrementales (seq: %d).\n", sm.NodeID, len(entries), newSequenceNumber)
-	sm.ApplyLogEntries(entries, newSequenceNumber)
-}
-
-// UpdateStateFromEvent es llamado por el primario cuando se agrega un nuevo evento.
-func (sm *SynchronizationModule) UpdateStateFromEvent(event Evento) {
+// AddEvent permite al primario añadir un nuevo evento al log.
+func (sm *SynchronizationModule) AddEvent(event Evento) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -216,6 +116,7 @@ func (sm *SynchronizationModule) UpdateStateFromEvent(event Evento) {
 	if sm.NodeState.IsPrimary {
 		sm.CurrentState.SequenceNumber++
 		sm.CurrentState.EventLog = append(sm.CurrentState.EventLog, event)
+		// Corregido: \\n a \n
 		fmt.Printf("Nodo %d (Primario): Nuevo evento añadido. Seq: %d, EventID: %d\n", sm.NodeID, sm.CurrentState.SequenceNumber, event.ID)
 
 		// Persistir el estado inmediatamente después de actualizarlo
@@ -224,7 +125,9 @@ func (sm *SynchronizationModule) UpdateStateFromEvent(event Evento) {
 		// Después de actualizar su propio estado, el primario debería replicar esto a los secundarios.
 		sm.ReplicateEventToSecondaries(event, sm.CurrentState.SequenceNumber)
 	} else {
-		fmt.Printf("Nodo %d: Intentó actualizar estado con evento, pero no es primario.\n", sm.NodeID)
+		// Corregido: \\n a \n
+		fmt.Printf("Nodo %d: Intentó actualizar estado con evento, pero no es primario. Primario conocido: %d\n", sm.NodeID, sm.Coordinator.PrimaryID)
+		// Opcional: Redirigir la solicitud al primario si no lo es.
 	}
 }
 
@@ -233,11 +136,47 @@ func (sm *SynchronizationModule) ReplicateEventToSecondaries(event Evento, newSe
 	sm.mu.Lock() // Proteger la lista de nodos si se modificara
 	defer sm.mu.Unlock()
 
+	// Corregido: \\n a \n
 	fmt.Printf("Nodo %d (Primario): Replicando evento (ID: %d, Seq: %d) a todos los secundarios.\n", sm.NodeID, event.ID, newSequence)
+	// Para un sistema real, se enviarían solo las entradas de log nuevas o un diff.
+	// Por simplicidad, se puede enviar el último evento y el nuevo SequenceNumber.
+	// O se puede enviar un "mini-log" con los cambios desde la última sincronización conocida.
+
+	// Aquí vamos a enviar el último evento añadido, asumiendo que los secundarios lo aplican si su SN es menor.
+	// Para el caso de recuperación, se usa SendStateMessage.
+	// Para replicación normal, solo se envía el nuevo evento y su SN.
+	// Pero el PDF dice "se asegura de que todos los servidores mantengan una réplica idéntica del estado",
+	// lo que sugiere que podrían necesitar el log completo o una parte.
+	// La forma más simple y robusta es enviar solo las nuevas entradas de log con el SN.
+	newEntries := []Evento{event} // Enviar solo el último evento añadido
+
 	for _, targetID := range sm.Coordinator.Nodes { // Usa la lista de nodos del coordinador
 		if targetID != sm.NodeID { // No enviar a sí mismo
-			// Aquí se podría enviar el evento como un mensaje tipo SEND_LOG o un tipo específico de replicación.
-			sm.SendLogEntriesMessage(targetID, []Evento{event}, newSequence)
+			// Aquí se debería enviar un mensaje específico para añadir entradas de log
+			sm.SendLogEntriesMessage(targetID, newEntries, newSequence)
 		}
+	}
+}
+
+// AddLogEntries maneja la adición de entradas de log replicadas desde el primario.
+func (sm *SynchronizationModule) AddLogEntries(entries []Evento, sequenceNumber int) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Solo actualiza si el primario es quien lo envía y el SN es más reciente
+	// o si el primario lo envía para poner al día al secundario.
+	if sequenceNumber > sm.CurrentState.SequenceNumber {
+		// Asumimos que las entradas son el *delta* o que el primario envía todo el log hasta ese SN.
+		// Si se envía el delta, se añadiría. Si se envía todo, se reemplazaría.
+		// Por simplicidad, si recibimos el log con un SN más alto, actualizamos completamente.
+		// Esto es menos eficiente pero más robusto si el log completo se envía para sincronización.
+		// Para replicación incremental, se añadiría el delta.
+		// Aquí, dado que solo AddEvent envía un único Evento, asumimos que 'entries' es un array de un único evento.
+		sm.CurrentState.EventLog = append(sm.CurrentState.EventLog, entries...) // Añadir las nuevas entradas
+		sm.CurrentState.SequenceNumber = sequenceNumber
+		fmt.Printf("Nodo %d: Entradas de log añadidas. Nuevo SequenceNumber: %d. Total eventos: %d.\n", sm.NodeID, sm.CurrentState.SequenceNumber, len(sm.CurrentState.EventLog))
+		sm.PersistenceModule.SaveState(sm.CurrentState)
+	} else {
+		fmt.Printf("Nodo %d: Ignorando entradas de log con SequenceNumber %d (local es %d).\n", sm.NodeID, sequenceNumber, sm.CurrentState.SequenceNumber)
 	}
 }

@@ -1,0 +1,9 @@
+{
+  "sequence_number": 1,
+  "event_log": [
+    {
+      "id": 1,
+      "value": "Mensaje_1_de_Nodo3"
+    }
+  ]
+}
