@@ -40,11 +40,8 @@ func NewServerNodeWrapper(id int, allNodeIDs []int) *ServerNodeWrapper {
 	currentState, err := persistenceMod.LoadState()
 	if err != nil {
 		fmt.Printf("Error cargando estado replicado para nodo %d: %v. Inicializando vacío.\n", id, err)
-		// Si LoadState ya maneja os.IsNotExist y retorna un estado vacío, esta rama podría ser redundante.
-		// Asegúrate de que LoadState siempre retorne un *Estado válido, incluso si es nuevo.
 		currentState = &servernode.Estado{SequenceNumber: 0, EventLog: []servernode.Evento{}}
 	}
-
 
 	sn := &ServerNodeWrapper{
 		NodeID:          id,

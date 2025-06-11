@@ -2,7 +2,7 @@
 package servernode
 
 import (
-	"encoding/json"
+	//"encoding/json"
 	"fmt"
 	"sync"
 )
@@ -32,6 +32,10 @@ type SynchronizationModule struct {
 	NodeState         *Nodo              // Referencia al estado del propio nodo
 	mu                sync.Mutex         // Mutex para proteger el estado durante la sincronización
 	PersistenceModule *PersistenceModule // Referencia al módulo de persistencia
+
+	SendRequestStateMessage func(targetID int, payload string)
+	SendStateMessage        func(targetID int, state Estado)
+	SendLogEntriesMessage   func(targetID int, entries []Evento, newSequenceNumber int)
 }
 
 // NewSynchronizationModule crea una nueva instancia del módulo de sincronización
@@ -116,9 +120,7 @@ func (sm *SynchronizationModule) ApplyLogEntries(entries []Evento, newSequenceNu
 }
 
 // --- Métodos de Simulación de Comunicación (serían redefinidos en main.go) ---
-// Estos métodos serán "sobrescritos" por las funciones de simulación en main.go
-// para enrutar los mensajes entre los ServerNodeWrapper.
-
+/*
 // SendRequestStateMessage simula el envío de una solicitud de estado.
 func (sm *SynchronizationModule) SendRequestStateMessage(targetID int, payload string) {
 	fmt.Printf("Nodo %d: Enviando REQUEST_STATE (mi secuencia: %s) a Nodo %d\n", sm.NodeID, payload, targetID)
@@ -150,7 +152,7 @@ func (sm *SynchronizationModule) SendLogEntriesMessage(targetID int, entries []E
 	}
 	fmt.Printf("Nodo %d: Enviando SEND_LOG (seq: %d, %d entradas) a Nodo %d\n", sm.NodeID, newSequenceNumber, len(entries), targetID)
 }
-
+*/
 // --- Métodos que serían llamados por el enrutador de mensajes (main.go) ---
 
 // HandleRequestStateMessage es llamado cuando el primario recibe una solicitud de estado.

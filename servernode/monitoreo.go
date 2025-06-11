@@ -14,6 +14,8 @@ type MonitorModule struct {
 	Ticker      *time.Ticker
 	Done        chan bool
 	mu          sync.Mutex
+	
+	SendHeartbeat func(targetID int) bool
 }
 
 // NewMonitorModule crea una instancia del módulo de monitoreo
@@ -66,11 +68,10 @@ func (mm *MonitorModule) CheckPrimary() {
 		go mm.Coordinator.StartElection()
 	}
 }
-
+/* Funcion reemplazada en main.go
 // SendHeartbeat simula el envío de un mensaje de latido al primario
 func (mm *MonitorModule) SendHeartbeat(targetID int) bool {
-	// Aquí debería hacerse una petición de red real.
-	// Por ahora se simula con un booleano aleatorio o control manual.
 	time.Sleep(500 * time.Millisecond)
 	return false // Simula que el primario ha caído
 }
+*/
