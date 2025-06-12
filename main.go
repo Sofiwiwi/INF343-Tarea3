@@ -92,11 +92,15 @@ func NewServerNodeWrapper(id int, allNodeIDs []int, nodeAddresses map[int]string
 		sendMessageFunc(targetID, servernode.MessageTypeOK, "")
 	}
 	sn.CoordinatorMod.SendCoordinatorMessage = func(targetID, coordinatorID int) {
+		fmt.Printf("Nodo %d: Enviando COORDINATOR a %d\n", sn.NodeID, targetID)
 		payloadData := struct {
 			CoordinatorID int `json:"coordinator_id"`
 		}{CoordinatorID: coordinatorID}
 		payloadJSON, _ := json.Marshal(payloadData)
-		sendMessageFunc(targetID, servernode.MessageTypeCoordinator, string(payloadJSON))
+		ok := sendMessageFunc(targetID, servernode.MessageTypeCoordinator, string(payloadJSON))
+		if !ok {
+			fmt.Printf("Nodo %d: Error al enviar COORDINATOR a %d\n", sn.NodeID, targetID)
+		}
 	}
 	sn.SyncMod.SendRequestStateMessage = func(targetID int, payload string) {
 		sendMessageFunc(targetID, servernode.MessageTypeRequestState, payload)
