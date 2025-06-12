@@ -6,6 +6,7 @@ import (
 	"time"
 )
 
+const HeartbeatTimeout = 2 * time.Second
 // MonitorModule es el módulo encargado de vigilar la salud del primario
 type MonitorModule struct {
 	NodeID      int
