@@ -97,11 +97,20 @@ func NewServerNodeWrapper(id int, allNodeIDs []int, nodeAddresses map[int]string
 			CoordinatorID int `json:"coordinator_id"`
 		}{CoordinatorID: coordinatorID}
 		payloadJSON, _ := json.Marshal(payloadData)
-		ok := sendMessageFunc(targetID, servernode.MessageTypeCoordinator, string(payloadJSON))
-		if !ok {
-			fmt.Printf("Nodo %d: Error al enviar COORDINATOR a %d\n", sn.NodeID, targetID)
+
+		for i := 1; i <= 3; i++ {
+			ok := sendMessageFunc(targetID, servernode.MessageTypeCoordinator, string(payloadJSON))
+			if ok {
+				fmt.Printf("Nodo %d: COORDINATOR enviado a %d exitosamente (intento %d)\n", sn.NodeID, targetID, i)
+				return
+			}
+			fmt.Printf("Nodo %d: Fallo al enviar COORDINATOR a %d (intento %d), reintentando...\n", sn.NodeID, targetID, i)
+			time.Sleep(1 * time.Second)
 		}
+
+		fmt.Printf("Nodo %d: No se pudo enviar COORDINATOR a %d tras 3 intentos\n", sn.NodeID, targetID)
 	}
+
 	sn.SyncMod.SendRequestStateMessage = func(targetID int, payload string) {
 		sendMessageFunc(targetID, servernode.MessageTypeRequestState, payload)
 	}
