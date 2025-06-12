@@ -1,7 +1,7 @@
 package main
 
 import (
-	"INF343-Tarea3/servernode" // Asegúrate de que esta ruta sea correcta para tu proyecto
+	"INF343-Tarea3/servernode" 
 	"bufio"
 	"encoding/json"
 	"fmt"
@@ -214,7 +214,7 @@ func SendMessageOverNetwork(senderID, targetID int, messageType, payload string,
 
 	conn, err := net.Dial("tcp", targetAddr)
 	if err != nil {
-		// fmt.Printf("Error al conectar con el nodo %d (%s): %v\n", targetID, targetAddr, err) // Descomentar para debug de conexiones
+		fmt.Printf("Error al conectar con el nodo %d (%s): %v\n", targetID, targetAddr, err) // Descomentar para debug de conexiones
 		return // Retornar silenciosamente si no se puede conectar (nodo caído o no levantado)
 	}
 	defer conn.Close()
