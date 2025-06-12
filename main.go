@@ -227,6 +227,10 @@ func (sn *ServerNodeWrapper) Start() {
 
 				if knownPrimary == -1 {
 					fmt.Printf("Nodo %d: Aún no hay primario conocido. Esperando antes de monitorear.\n", sn.NodeID)
+					if time.Since(sn.CoordinatorMod.LastElectionTime) > 10*time.Second {
+						fmt.Printf("Nodo %d: No se ha anunciado ningún primario tras 10s. Iniciando elección de recuperación...\n", sn.NodeID)
+						go sn.CoordinatorMod.StartElection()
+					}
 					continue
 				}
 				if !isPrimary && !sn.MonitorStarted {
