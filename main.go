@@ -250,17 +250,16 @@ func (sn *ServerNodeWrapper) Start() {
 	// Espera un poco para que los servidores de los otros nodos se inicien
 	time.Sleep(3 * time.Second)
 
-	// Lógica de arranque y recuperación
 	go func() {
-		// Si un nodo se reinicia, no sabe quién es el primario. Debe reconciliarse.
 		if !sn.NodeState.IsPrimary {
-			fmt.Printf("Nodo %d: Nodo secundario iniciado. Intentando encontrar al primario para sincronizar...\n", sn.NodeID)
-			// Primero, intenta una elección para asegurar que haya un primario activo.
-			// Si ya hay uno, la elección cederá rápidamente. Si no, se elegirá uno.
-			go sn.CoordinatorMod.StartElection()
+			lowestNodeID := sn.CoordinatorMod.Nodes[0]
+			if sn.NodeID == lowestNodeID {
+				fmt.Printf("Nodo %d: Soy el de ID más bajo del clúster. Asumiendo responsabilidad de iniciar la primera elección...\n", sn.NodeID)
+				go sn.CoordinatorMod.StartElection()
+			} else {
+				fmt.Printf("Nodo %d: Nodo secundario iniciado. Esperando descubrimiento de líder.\n", sn.NodeID)
+			}
 		}
-
-		// Lógica periódica para verificar si el monitor de primario debe estar activo.
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
