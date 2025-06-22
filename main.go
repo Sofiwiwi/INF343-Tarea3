@@ -289,33 +289,25 @@ func (sn *ServerNodeWrapper) Start() {
 
 	// Lógica para que el primario simule y replique eventos
 	go func() {
+		// Creamos un ticker que se dispara cada 4 segundos, independientemente de si somos primarios o no.
+		eventTicker := time.NewTicker(4 * time.Second)
+		defer eventTicker.Stop()
+
+		// Bucle infinito que espera los ticks del reloj.
 		for {
-			time.Sleep(1 * time.Second) // Chequea cada segundo si se ha convertido en primario
 			select {
+			// Se ha recibido un tick.
+			case <-eventTicker.C:
+				// SÓLO SI SOMOS EL PRIMARIO en este preciso momento, generamos un evento.
+				if sn.NodeState.IsPrimary {
+					fmt.Printf("Nodo %d (Primario): Generando evento periódico...\n", sn.NodeID)
+					// Simula un nuevo evento
+					newEvent := servernode.Evento{Value: fmt.Sprintf("Evento_simulado_del_Nodo_%d_a_las_%s", sn.NodeID, time.Now().Format("15:04:05"))}
+					sn.SyncMod.AddEvent(newEvent)
+				}
+			// El nodo se está deteniendo, salimos del bucle.
 			case <-sn.StopChan:
 				return
-			default:
-				if sn.NodeState.IsPrimary {
-					fmt.Printf("Nodo %d: Soy primario. Iniciando generación y replicación de eventos.\n", sn.NodeID)
-					eventTicker := time.NewTicker(4 * time.Second)
-					defer eventTicker.Stop()
-
-					for {
-						select {
-						case <-eventTicker.C:
-							if sn.NodeState.IsPrimary {
-								// Simula un nuevo evento
-								newEvent := servernode.Evento{Value: fmt.Sprintf("Evento_simulado_del_Nodo_%d_a_las_%s", sn.NodeID, time.Now().Format("15:04:05"))}
-								sn.SyncMod.AddEvent(newEvent)
-							} else {
-								fmt.Printf("Nodo %d: Dejé de ser primario, deteniendo la generación de eventos.\n", sn.NodeID)
-								return // Sale del bucle de generación de eventos
-							}
-						case <-sn.StopChan:
-							return
-						}
-					}
-				}
 			}
 		}
 	}()
