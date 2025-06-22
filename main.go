@@ -248,7 +248,7 @@ func (sn *ServerNodeWrapper) Start() {
 	go sn.startApiServer() // Inicia el servidor API
 
 	// Espera un poco para que los servidores de los otros nodos se inicien
-	time.Sleep(3 * time.Second)
+	time.Sleep(7 * time.Second)
 
 	go func() {
 		if !sn.NodeState.IsPrimary {
