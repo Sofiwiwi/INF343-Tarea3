@@ -2,41 +2,42 @@ package main
 
 import (
 	"INF343-Tarea3/servernode"
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
+	"net/http"
 	"os"
 	"strconv"
-	"sync"
+	//"sync"
 	"time"
 )
 
+// ServerNodeWrapper encapsula toda la lógica y estado de un nodo.
 type ServerNodeWrapper struct {
-	NodeID            int
-	CoordinatorMod    *servernode.CoordinatorModule
-	MonitorMod        *servernode.MonitorModule
-	SyncMod           *servernode.SynchronizationModule
-	PersistenceMod    *servernode.PersistenceModule
-	NodeState         *servernode.Nodo
-	CurrentState      *servernode.Estado
-	InboundMessages   chan servernode.Message
-	StopChan          chan struct{}
-	IsStopped         bool
-	NodeAddresses     map[int]string
-	MonitorStarted    bool
-	HeartbeatResponse map[int]chan bool
-	hrMutex sync.Mutex
+	NodeID         int
+	CoordinatorMod *servernode.CoordinatorModule
+	MonitorMod     *servernode.MonitorModule
+	SyncMod        *servernode.SynchronizationModule
+	PersistenceMod *servernode.PersistenceModule
+	NodeState      *servernode.Nodo
+	CurrentState   *servernode.Estado
+	StopChan       chan struct{}
+	NodeAddresses  map[int]string
+	MonitorStarted bool
+	httpClient     *http.Client // Cliente HTTP para la comunicación entre nodos
 }
 
+// NewServerNodeWrapper crea e inicializa un nuevo nodo con todos sus módulos.
 func NewServerNodeWrapper(id int, allNodeIDs []int, nodeAddresses map[int]string) *ServerNodeWrapper {
+	// Carga del estado persistido del nodo (si es primario o no)
 	nodeState, err := servernode.LoadNodeStateFromFile(id)
 	if err != nil {
 		fmt.Printf("Nodo %d: Error cargando estado del nodo: %v. Creando nuevo estado.\n", id, err)
-		nodeState = &servernode.Nodo{ID: id, IsPrimary: false, LastMessage: time.Now().Format(time.RFC3339)}
+		nodeState = &servernode.Nodo{ID: id, IsPrimary: false}
 	}
 
+	// Carga del estado replicado (el log de eventos)
 	persistenceMod := servernode.NewPersistenceModule(id)
 	currentState, err := persistenceMod.LoadState()
 	if err != nil {
@@ -45,200 +46,241 @@ func NewServerNodeWrapper(id int, allNodeIDs []int, nodeAddresses map[int]string
 	}
 
 	sn := &ServerNodeWrapper{
-		NodeID:            id,
-		NodeState:         nodeState,
-		CurrentState:      currentState,
-		StopChan:          make(chan struct{}),
-		IsStopped:         false,
-		PersistenceMod:    persistenceMod,
-		InboundMessages:   make(chan servernode.Message, 100),
-		NodeAddresses:     nodeAddresses,
-		HeartbeatResponse: make(map[int]chan bool),
+		NodeID:         id,
+		NodeState:      nodeState,
+		CurrentState:   currentState,
+		StopChan:       make(chan struct{}),
+		PersistenceMod: persistenceMod,
+		NodeAddresses:  nodeAddresses,
+		httpClient: &http.Client{
+			Timeout: 2 * time.Second, // Timeout para las llamadas API
+		},
 	}
 
+	// Inicialización de los módulos
 	sn.CoordinatorMod = servernode.NewCoordinatorModule(id, allNodeIDs, sn.NodeState)
 	sn.MonitorMod = servernode.NewMonitorModule(id, -1, sn.CoordinatorMod)
 	sn.SyncMod = servernode.NewSynchronizationModule(id, sn.CoordinatorMod, sn.CurrentState, sn.NodeState, sn.PersistenceMod)
 
-	sendMessageFunc := func(targetID int, msgType string, payload string) bool {
-		targetAddr, ok := sn.NodeAddresses[targetID]
-		if !ok {
-			fmt.Printf("Nodo %d: Error: Dirección desconocida para el nodo %d\n", sn.NodeID, targetID)
-			return false
-		}
-		msg := servernode.Message{
-			SenderID:    sn.NodeID,
-			TargetID:    targetID,
-			MessageType: msgType,
-			Payload:     payload,
-		}
-		for i := 0; i < 3; i++ {
-			err := SendMessageTCP(targetAddr, msg)
-			if err != nil {
-				fmt.Printf("Nodo %d: Intento %d - Error al enviar %s a %d (%s): %v\n", sn.NodeID, i+1, msgType, targetID, targetAddr, err)
-				time.Sleep(1 * time.Second)
-				continue
-			}
-			return true
-		}
-		fmt.Printf("Nodo %d: Fallaron los 3 intentos de enviar %s a %d\n", sn.NodeID, msgType, targetID)
-		return false
-	}
-
-	sn.CoordinatorMod.SendElectionMessage = func(targetID int) bool {
-		return sendMessageFunc(targetID, servernode.MessageTypeElection, "")
-	}
-	sn.CoordinatorMod.SendOKMessage = func(targetID int) {
-		sendMessageFunc(targetID, servernode.MessageTypeOK, "")
-	}
-	sn.CoordinatorMod.SendCoordinatorMessage = func(targetID, coordinatorID int) {
-		fmt.Printf("Nodo %d: Enviando COORDINATOR a %d\n", sn.NodeID, targetID)
-		payloadData := struct {
-			CoordinatorID int `json:"coordinator_id"`
-		}{CoordinatorID: coordinatorID}
-		payloadJSON, _ := json.Marshal(payloadData)
-
-		for i := 1; i <= 3; i++ {
-			ok := sendMessageFunc(targetID, servernode.MessageTypeCoordinator, string(payloadJSON))
-			if ok {
-				fmt.Printf("Nodo %d: COORDINATOR enviado a %d exitosamente (intento %d)\n", sn.NodeID, targetID, i)
-				return
-			}
-			fmt.Printf("Nodo %d: Fallo al enviar COORDINATOR a %d (intento %d), reintentando...\n", sn.NodeID, targetID, i)
-			time.Sleep(1 * time.Second)
-		}
-
-		fmt.Printf("Nodo %d: No se pudo enviar COORDINATOR a %d tras 3 intentos\n", sn.NodeID, targetID)
-	}
-
-	sn.SyncMod.SendRequestStateMessage = func(targetID int, payload string) {
-		sendMessageFunc(targetID, servernode.MessageTypeRequestState, payload)
-	}
-	sn.SyncMod.SendStateMessage = func(targetID int, state servernode.Estado) {
-		payloadJSON, _ := json.Marshal(state)
-		sendMessageFunc(targetID, servernode.MessageTypeSendState, string(payloadJSON))
-	}
-	sn.SyncMod.SendLogEntriesMessage = func(targetID int, entries []servernode.Evento, newSequenceNumber int) {
-		payloadData := struct {
-			Entries        []servernode.Evento `json:"entries"`
-			SequenceNumber int                 `json:"sequence_number"`
-		}{Entries: entries, SequenceNumber: newSequenceNumber}
-		payloadJSON, _ := json.Marshal(payloadData)
-		sendMessageFunc(targetID, servernode.MessageTypeSendLog, string(payloadJSON))
-	}
-
-	sn.MonitorMod.SendHeartbeat = func(targetID int) bool {
-		sn.hrMutex.Lock()
-		responseChan := make(chan bool, 1)
-		sn.HeartbeatResponse[targetID] = responseChan
-		sn.hrMutex.Unlock()
-
-		sent := sendMessageFunc(targetID, servernode.MessageTypeAreYouAlive, "")
-		if !sent {
-			sn.hrMutex.Lock()
-			delete(sn.HeartbeatResponse, targetID)
-			sn.hrMutex.Unlock()
-			return false
-		}
-
-		select {
-		case alive := <-responseChan:
-			sn.hrMutex.Lock()
-			delete(sn.HeartbeatResponse, targetID)
-			sn.hrMutex.Unlock()
-			return alive
-		case <-time.After(servernode.HeartbeatTimeout):
-			fmt.Printf("Nodo %d: Timeout esperando respuesta de heartbeat de %d.\n", sn.NodeID, targetID)
-			sn.hrMutex.Lock()
-			delete(sn.HeartbeatResponse, targetID)
-			sn.hrMutex.Unlock()
-			return false
-		}
-	}
+	// Inyección de dependencias de comunicación (funciones que usan el cliente HTTP)
+	sn.injectCommunicationFunctions()
 
 	return sn
 }
 
-func (sn *ServerNodeWrapper) processInboundMessages() {
-	for {
-		select {
-		case msg := <-sn.InboundMessages:
-			log.Printf("Nodo %d: Recibido mensaje de %d, tipo: %s\n", sn.NodeID, msg.SenderID, msg.MessageType)
-			switch msg.MessageType {
-			case servernode.MessageTypeElection:
-				sn.CoordinatorMod.HandleElectionMessage(msg.SenderID)
-			case servernode.MessageTypeOK:
-				sn.hrMutex.Lock()
-				if responseChan, ok := sn.HeartbeatResponse[msg.SenderID]; ok {
-					select {
-					case responseChan <- true:
-					default:
-					}
-				}
-				sn.hrMutex.Unlock()
-			case servernode.MessageTypeCoordinator:
-				var payload struct {
-					CoordinatorID int `json:"coordinator_id"`
-				}
-				if err := json.Unmarshal([]byte(msg.Payload), &payload); err == nil {
-					sn.CoordinatorMod.HandleCoordinatorMessage(payload.CoordinatorID)
-				}
-			case servernode.MessageTypeAreYouAlive:
-				fmt.Printf("Nodo %d: Recibido ARE_YOU_ALIVE de %d. Respondiendo OK.\n", sn.NodeID, msg.SenderID)
-				targetAddr := sn.NodeAddresses[msg.SenderID]
-				SendMessageTCP(targetAddr, servernode.Message{
-					SenderID:    sn.NodeID,
-					TargetID:    msg.SenderID,
-					MessageType: servernode.MessageTypeOK,
-					Payload:     "",
-				})
-			default:
-				fmt.Printf("Nodo %d: Mensaje desconocido: %s\n", sn.NodeID, msg.MessageType)
+// sendAPIRequest es una función genérica para realizar llamadas HTTP a otros nodos.
+func (sn *ServerNodeWrapper) sendAPIRequest(targetID int, method, endpoint string, payload interface{}) (*http.Response, error) {
+	targetAddr, ok := sn.NodeAddresses[targetID]
+	if !ok {
+		return nil, fmt.Errorf("dirección desconocida para el nodo %d", targetID)
+	}
+	url := fmt.Sprintf("http://%s%s", targetAddr, endpoint)
+
+	var reqBody []byte
+	var err error
+	if payload != nil {
+		reqBody, err = json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("error al serializar payload: %w", err)
+		}
+	}
+
+	req, err := http.NewRequest(method, url, bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("error al crear request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// Se añade un header para identificar al emisor, útil en los handlers
+	req.Header.Set("X-Sender-ID", strconv.Itoa(sn.NodeID))
+
+	return sn.httpClient.Do(req)
+}
+
+// injectCommunicationFunctions asigna las implementaciones de las funciones de comunicación a los módulos.
+func (sn *ServerNodeWrapper) injectCommunicationFunctions() {
+	// --- Funciones para el Módulo de Coordinación ---
+	sn.CoordinatorMod.SendElectionMessage = func(targetID int) bool {
+		resp, err := sn.sendAPIRequest(targetID, "POST", "/election", nil)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			// Si hay error o el status no es OK, se considera que no respondió.
+			return false
+		}
+		resp.Body.Close()
+		return true // Un 200 OK significa que el nodo superior respondió.
+	}
+
+	sn.CoordinatorMod.SendCoordinatorMessage = func(targetID, coordinatorID int) {
+		payload := map[string]int{"coordinator_id": coordinatorID}
+		for i := 0; i < 3; i++ { // Reintentos
+			resp, err := sn.sendAPIRequest(targetID, "POST", "/coordinator", payload)
+			if err == nil {
+				resp.Body.Close()
+				return
 			}
-		case <-sn.StopChan:
-			return
+			time.Sleep(500 * time.Millisecond)
+		}
+		fmt.Printf("Nodo %d: Fallaron todos los intentos de enviar COORDINATOR a %d\n", sn.NodeID, targetID)
+	}
+
+	// --- Funciones para el Módulo de Monitoreo ---
+	sn.MonitorMod.SendHeartbeat = func(targetID int) bool {
+		resp, err := sn.sendAPIRequest(targetID, "GET", "/are-you-alive", nil)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			return false
+		}
+		resp.Body.Close()
+		return true
+	}
+
+	// --- Funciones para el Módulo de Sincronización ---
+	sn.SyncMod.SendRequestStateMessage = func(targetID int, payload string) {
+		// El payload de esta función no se usa en la nueva implementación.
+		resp, err := sn.sendAPIRequest(targetID, "POST", "/request-state", nil)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}
+
+	sn.SyncMod.SendStateMessage = func(targetID int, state servernode.Estado) {
+		resp, err := sn.sendAPIRequest(targetID, "POST", "/send-state", state)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}
+
+	sn.SyncMod.SendLogEntriesMessage = func(targetID int, entries []servernode.Evento, newSequenceNumber int) {
+		payload := map[string]interface{}{"entries": entries, "sequence_number": newSequenceNumber}
+		resp, err := sn.sendAPIRequest(targetID, "POST", "/send-log", payload)
+		if err == nil {
+			resp.Body.Close()
 		}
 	}
 }
 
+// startApiServer inicia el servidor HTTP para escuchar las peticiones de otros nodos.
+func (sn *ServerNodeWrapper) startApiServer() {
+	mux := http.NewServeMux()
+
+	// Endpoint para recibir un mensaje de elección
+	mux.HandleFunc("/election", func(w http.ResponseWriter, r *http.Request) {
+		senderID, _ := strconv.Atoi(r.Header.Get("X-Sender-ID"))
+		sn.CoordinatorMod.HandleElectionMessage(senderID)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Endpoint para recibir el anuncio de un nuevo coordinador
+	mux.HandleFunc("/coordinator", func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			CoordinatorID int `json:"coordinator_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err == nil {
+			sn.CoordinatorMod.HandleCoordinatorMessage(payload.CoordinatorID)
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+
+	// Endpoint para los heartbeats (detección de fallos)
+	mux.HandleFunc("/are-you-alive", func(w http.ResponseWriter, r *http.Request) {
+		senderID, _ := strconv.Atoi(r.Header.Get("X-Sender-ID"))
+		fmt.Printf("Nodo %d: Recibido ARE_YOU_ALIVE de %d. Respondiendo OK.\n", sn.NodeID, senderID)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Endpoint para que un nodo solicite el estado completo
+	mux.HandleFunc("/request-state", func(w http.ResponseWriter, r *http.Request) {
+		senderID, _ := strconv.Atoi(r.Header.Get("X-Sender-ID"))
+		sn.SyncMod.HandleRequestStateMessage(senderID)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Endpoint para recibir el estado completo del primario
+	mux.HandleFunc("/send-state", func(w http.ResponseWriter, r *http.Request) {
+		var state servernode.Estado
+		if err := json.NewDecoder(r.Body).Decode(&state); err == nil {
+			sn.SyncMod.UpdateState(&state)
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+
+	// Endpoint para recibir nuevas entradas del log
+	mux.HandleFunc("/send-log", func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Entries        []servernode.Evento `json:"entries"`
+			SequenceNumber int                 `json:"sequence_number"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err == nil {
+			sn.SyncMod.AddLogEntries(payload.Entries, payload.SequenceNumber)
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+
+	// Endpoint para simular la llegada de un nuevo evento al primario
+	mux.HandleFunc("/add-event", func(w http.ResponseWriter, r *http.Request) {
+		if !sn.NodeState.IsPrimary {
+			http.Error(w, "No soy el primario", http.StatusServiceUnavailable)
+			return
+		}
+		var event servernode.Evento
+		if err := json.NewDecoder(r.Body).Decode(&event); err == nil {
+			sn.SyncMod.AddEvent(event)
+			w.WriteHeader(http.StatusOK)
+		} else {
+			http.Error(w, "Cuerpo de la petición inválido", http.StatusBadRequest)
+		}
+	})
+
+	listenAddr := sn.NodeAddresses[sn.NodeID]
+	fmt.Printf("Nodo %d: Servidor API escuchando en http://%s\n", sn.NodeID, listenAddr)
+	if err := http.ListenAndServe(listenAddr, mux); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("Nodo %d: Fallo al iniciar servidor API: %v", sn.NodeID, err)
+	}
+}
+
+// Start inicia todos los procesos en segundo plano del nodo.
 func (sn *ServerNodeWrapper) Start() {
 	fmt.Printf("Nodo %d: Iniciando...\n", sn.NodeID)
-	sn.IsStopped = false
-	go ListenForMessages(sn, sn.NodeAddresses[sn.NodeID])
-	go sn.processInboundMessages()
-	time.Sleep(2 * time.Second)
+	go sn.startApiServer() // Inicia el servidor API
 
-	if sn.NodeID == 1 && !sn.NodeState.IsPrimary {
-		fmt.Printf("Nodo %d: No es primario al inicio y es el Nodo 1. Iniciando elección para convertirse en primario inicial.\n", sn.NodeID)
-		sn.CoordinatorMod.StartElection()
-		time.Sleep(3 * time.Second)
-	}
+	// Espera un poco para que los servidores de los otros nodos se inicien
+	time.Sleep(3 * time.Second)
 
+	// Lógica de arranque y recuperación
 	go func() {
+		// Si un nodo se reinicia, no sabe quién es el primario. Debe reconciliarse.
+		if !sn.NodeState.IsPrimary {
+			fmt.Printf("Nodo %d: Nodo secundario iniciado. Intentando encontrar al primario para sincronizar...\n", sn.NodeID)
+			// Primero, intenta una elección para asegurar que haya un primario activo.
+			// Si ya hay uno, la elección cederá rápidamente. Si no, se elegirá uno.
+			go sn.CoordinatorMod.StartElection()
+		}
+
+		// Lógica periódica para verificar si el monitor de primario debe estar activo.
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-sn.StopChan:
 				return
-			case <-time.After(2 * time.Second):
+			case <-ticker.C:
 				sn.CoordinatorMod.ElectionLock.Lock()
 				isPrimary := sn.NodeState.IsPrimary
 				knownPrimary := sn.CoordinatorMod.PrimaryID
 				sn.CoordinatorMod.ElectionLock.Unlock()
 
-				if knownPrimary == -1 {
-					fmt.Printf("Nodo %d: Aún no hay primario conocido. Esperando antes de monitorear.\n", sn.NodeID)
-					if time.Since(sn.CoordinatorMod.LastElectionTime) > 10*time.Second {
-						fmt.Printf("Nodo %d: No se ha anunciado ningún primario tras 10s. Iniciando elección de recuperación...\n", sn.NodeID)
-						go sn.CoordinatorMod.StartElection()
+				if !isPrimary && knownPrimary != -1 {
+					if !sn.MonitorStarted {
+						fmt.Printf("Nodo %d: Activando monitor del primario (%d).\n", sn.NodeID, knownPrimary)
+						sn.MonitorMod.Start()
+						sn.MonitorStarted = true
 					}
-					continue
-				}
-				if !isPrimary && !sn.MonitorStarted {
-					fmt.Printf("Nodo %d: No es primario y el monitor no está activo. Iniciando monitoreo.\n", sn.NodeID)
-					sn.MonitorMod.Start()
-					sn.MonitorStarted = true
 				} else if isPrimary && sn.MonitorStarted {
-					fmt.Printf("Nodo %d: Es primario y el monitor está activo. Deteniendo monitoreo.\n", sn.NodeID)
+					fmt.Printf("Nodo %d: Soy primario, deteniendo monitor.\n", sn.NodeID)
 					sn.MonitorMod.Stop()
 					sn.MonitorStarted = false
 				}
@@ -246,31 +288,29 @@ func (sn *ServerNodeWrapper) Start() {
 		}
 	}()
 
+	// Lógica para que el primario simule y replique eventos
 	go func() {
 		for {
+			time.Sleep(1 * time.Second) // Chequea cada segundo si se ha convertido en primario
 			select {
 			case <-sn.StopChan:
 				return
-			case <-time.After(1 * time.Second):
-				sn.CoordinatorMod.ElectionLock.Lock()
-				isPrimary := sn.NodeState.IsPrimary
-				sn.CoordinatorMod.ElectionLock.Unlock()
-				if isPrimary {
-					fmt.Printf("Nodo %d: Es primario, comenzando o continuando la adición de eventos.\n", sn.NodeID)
-					ticker := time.NewTicker(4 * time.Second)
-					defer ticker.Stop()
+			default:
+				if sn.NodeState.IsPrimary {
+					fmt.Printf("Nodo %d: Soy primario. Iniciando generación y replicación de eventos.\n", sn.NodeID)
+					eventTicker := time.NewTicker(4 * time.Second)
+					defer eventTicker.Stop()
+
 					for {
 						select {
-						case <-ticker.C:
-							sn.CoordinatorMod.ElectionLock.Lock()
-							currentIsPrimary := sn.NodeState.IsPrimary
-							sn.CoordinatorMod.ElectionLock.Unlock()
-							if currentIsPrimary {
-								newEvent := servernode.Evento{Value: fmt.Sprintf("Mensaje_de_Nodo%d", sn.NodeID)}
+						case <-eventTicker.C:
+							if sn.NodeState.IsPrimary {
+								// Simula un nuevo evento
+								newEvent := servernode.Evento{Value: fmt.Sprintf("Evento_simulado_del_Nodo_%d_a_las_%s", sn.NodeID, time.Now().Format("15:04:05"))}
 								sn.SyncMod.AddEvent(newEvent)
 							} else {
-								fmt.Printf("Nodo %d: Ya no soy primario, deteniendo generación de eventos.\n", sn.NodeID)
-								return
+								fmt.Printf("Nodo %d: Dejé de ser primario, deteniendo la generación de eventos.\n", sn.NodeID)
+								return // Sale del bucle de generación de eventos
 							}
 						case <-sn.StopChan:
 							return
@@ -281,66 +321,19 @@ func (sn *ServerNodeWrapper) Start() {
 		}
 	}()
 
-	<-sn.StopChan
+	<-sn.StopChan // Bloquea hasta que se llame a Stop()
 	fmt.Printf("Nodo %d: Detenido.\n", sn.NodeID)
-	sn.IsStopped = true
-	if sn.MonitorMod != nil && sn.MonitorStarted {
-		sn.MonitorMod.Stop()
-	}
-	sn.NodeState.SaveNodeStateToFile()
-	sn.PersistenceMod.SaveState(sn.CurrentState)
 }
 
+// Stop detiene el nodo de forma segura.
 func (sn *ServerNodeWrapper) Stop() {
 	close(sn.StopChan)
-}
-
-func SendMessageTCP(targetAddress string, msg servernode.Message) error {
-	conn, err := net.Dial("tcp", targetAddress)
-	if err != nil {
-		return fmt.Errorf("fallo al conectar a %s: %w", targetAddress, err)
+	if sn.MonitorStarted {
+		sn.MonitorMod.Stop()
 	}
-	defer conn.Close()
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(msg); err != nil {
-		return fmt.Errorf("fallo al codificar y enviar mensaje a %s: %w", targetAddress, err)
-	}
-	return nil
-}
-
-func ListenForMessages(node *ServerNodeWrapper, listenAddress string) {
-	listener, err := net.Listen("tcp", listenAddress)
-	if err != nil {
-		fmt.Printf("Nodo %d: Error al iniciar listener TCP en %s: %v\n", node.NodeID, listenAddress, err)
-		return
-	}
-	defer listener.Close()
-	fmt.Printf("Nodo %d: Escuchando mensajes TCP en %s\n", node.NodeID, listenAddress)
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			select {
-			case <-node.StopChan:
-				fmt.Printf("Nodo %d: Listener detenido.\n", node.NodeID)
-				return
-			default:
-				continue
-			}
-		}
-		go handleConnection(conn, node.InboundMessages)
-	}
-}
-
-func handleConnection(conn net.Conn, inboundMessages chan<- servernode.Message) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-	decoder := json.NewDecoder(reader)
-	var msg servernode.Message
-	if err := decoder.Decode(&msg); err != nil {
-		return
-	}
-	inboundMessages <- msg
+	// Persistir estado final
+	sn.NodeState.SaveNodeStateToFile()
+	sn.PersistenceMod.SaveState(sn.CurrentState)
 }
 
 func main() {
@@ -350,17 +343,37 @@ func main() {
 	}
 	nodeID, err := strconv.Atoi(os.Args[1])
 	if err != nil {
-		fmt.Printf("Error: %s no es un número válido para nodeID\n", os.Args[1])
+		fmt.Printf("Error: '%s' no es un ID de nodo válido.\n", os.Args[1])
 		os.Exit(1)
 	}
 
+	// Configuración de las direcciones de los nodos
 	nodeAddresses := map[int]string{
 		1: "10.10.28.17:8001",
 		2: "10.10.28.18:8001",
 		3: "10.10.28.19:8001",
 	}
+	// Asegúrate de que el ID proporcionado existe en la configuración.
+	if _, ok := nodeAddresses[nodeID]; !ok {
+		fmt.Printf("Error: ID de nodo %d no encontrado en la configuración de direcciones.\n", nodeID)
+		os.Exit(1)
+	}
 
-	allNodeIDs := []int{1, 2, 3}
+
+	allNodeIDs := make([]int, 0, len(nodeAddresses))
+	for id := range nodeAddresses {
+		allNodeIDs = append(allNodeIDs, id)
+	}
+
 	node := NewServerNodeWrapper(nodeID, allNodeIDs, nodeAddresses)
+	
+	// Utiliza un canal para esperar una señal de interrupción (Ctrl+C) y detener el nodo limpiamente.
+	sigChan := make(chan os.Signal, 1)
+	go func() {
+		<-sigChan
+		fmt.Printf("\nNodo %d: Recibida señal de interrupción, deteniendo...\n", node.NodeID)
+		node.Stop()
+	}()
+
 	node.Start()
 }
