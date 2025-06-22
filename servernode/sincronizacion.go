@@ -5,6 +5,7 @@ import (
 	// Asegurado que esté importado para la consistencia del Message struct
 	"fmt"
 	"sync"
+	"time"
 )
 
 // Definimos nuevos tipos de mensajes para la sincronización
@@ -159,24 +160,22 @@ func (sm *SynchronizationModule) ReplicateEventToSecondaries(event Evento, newSe
 }
 
 // AddLogEntries maneja la adición de entradas de log replicadas desde el primario.
-func (sm *SynchronizationModule) AddLogEntries(entries []Evento, sequenceNumber int) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
+func (sm *SynchronizationModule) AddLogEntries(senderID int, entries []Evento, sequenceNumber int) {
+    sm.mu.Lock()
+    defer sm.mu.Unlock()
 
-	// Solo actualiza si el primario es quien lo envía y el SN es más reciente
-	// o si el primario lo envía para poner al día al secundario.
-	if sequenceNumber > sm.CurrentState.SequenceNumber {
-		// Asumimos que las entradas son el *delta* o que el primario envía todo el log hasta ese SN.
-		// Si se envía el delta, se añadiría. Si se envía todo, se reemplazaría.
-		// Por simplicidad, si recibimos el log con un SN más alto, actualizamos completamente.
-		// Esto es menos eficiente pero más robusto si el log completo se envía para sincronización.
-		// Para replicación incremental, se añadiría el delta.
-		// Aquí, dado que solo AddEvent envía un único Evento, asumimos que 'entries' es un array de un único evento.
-		sm.CurrentState.EventLog = append(sm.CurrentState.EventLog, entries...) // Añadir las nuevas entradas
-		sm.CurrentState.SequenceNumber = sequenceNumber
-		fmt.Printf("Nodo %d: Entradas de log añadidas. Nuevo SequenceNumber: %d. Total eventos: %d.\n", sm.NodeID, sm.CurrentState.SequenceNumber, len(sm.CurrentState.EventLog))
-		sm.PersistenceModule.SaveState(sm.CurrentState)
-	} else {
-		fmt.Printf("Nodo %d: Ignorando entradas de log con SequenceNumber %d (local es %d).\n", sm.NodeID, sequenceNumber, sm.CurrentState.SequenceNumber)
-	}
+    if sm.Coordinator.PrimaryID == -1 {
+        fmt.Printf("Nodo %d: Descubierto al líder %d a través de replicación de logs.\n", sm.NodeID, senderID)
+        sm.Coordinator.PrimaryID = senderID
+        sm.Coordinator.PrimaryLastSeen = time.Now()
+    }
+
+    if sequenceNumber > sm.CurrentState.SequenceNumber {
+        sm.CurrentState.EventLog = append(sm.CurrentState.EventLog, entries...)
+        sm.CurrentState.SequenceNumber = sequenceNumber
+        fmt.Printf("Nodo %d: Entradas de log añadidas. Nuevo SequenceNumber: %d. Total eventos: %d.\n", sm.NodeID, sm.CurrentState.SequenceNumber, len(sm.CurrentState.EventLog))
+        sm.PersistenceModule.SaveState(sm.CurrentState)
+    } else {
+        fmt.Printf("Nodo %d: Ignorando entradas de log con SequenceNumber %d (local es %d).\n", sm.NodeID, sequenceNumber, sm.CurrentState.SequenceNumber)
+    }
 }

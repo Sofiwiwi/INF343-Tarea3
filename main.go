@@ -207,19 +207,22 @@ func (sn *ServerNodeWrapper) startApiServer() {
 	})
 
 	// Endpoint para recibir nuevas entradas del log
+
 	mux.HandleFunc("/send-log", func(w http.ResponseWriter, r *http.Request) {
+		// Obtenemos la ID del emisor desde el header
+		senderID, _ := strconv.Atoi(r.Header.Get("X-Sender-ID"))
 		var payload struct {
 			Entries        []servernode.Evento `json:"entries"`
 			SequenceNumber int                 `json:"sequence_number"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err == nil {
-			sn.SyncMod.AddLogEntries(payload.Entries, payload.SequenceNumber)
+			// Pasamos la senderID a la función
+			sn.SyncMod.AddLogEntries(senderID, payload.Entries, payload.SequenceNumber)
 			w.WriteHeader(http.StatusOK)
 		} else {
 			w.WriteHeader(http.StatusBadRequest)
 		}
 	})
-
 	// Endpoint para simular la llegada de un nuevo evento al primario
 	mux.HandleFunc("/add-event", func(w http.ResponseWriter, r *http.Request) {
 		if !sn.NodeState.IsPrimary {
@@ -253,7 +256,7 @@ func (sn *ServerNodeWrapper) Start() {
 	go func() {
 		if !sn.NodeState.IsPrimary {
 			fmt.Printf("Nodo %d: Nodo secundario iniciado. Intentando encontrar al primario para sincronizar...\n", sn.NodeID)
-			go sn.CoordinatorMod.StartElection()
+			//go sn.CoordinatorMod.StartElection()
 		}
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
