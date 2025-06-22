@@ -136,22 +136,29 @@ func (cm *CoordinatorModule) AnnounceCoordinator() {
 	cm.PrimaryLastSeen = time.Now()
 }
 
-// HandleElectionMessage procesa un mensaje ELECTION recibido.
-func (cm *CoordinatorModule) HandleElectionMessage(senderID int) {
-	fmt.Printf("Nodo %d: Recibió ELECTION de %d.\n", cm.NodeID, senderID)
-	// La respuesta "OK" se maneja devolviendo un status 200 OK en el handler de la API.
 
-	// Si este nodo tiene un ID más alto, inicia su propia elección.
-	if cm.NodeID > senderID {
-		cm.ElectionLock.Lock()
-		if !cm.ElectionRunning {
-			fmt.Printf("Nodo %d: Soy más alto que %d. Iniciando mi propia elección.\n", cm.NodeID, senderID)
-			go cm.StartElection()
-		} else {
-			fmt.Printf("Nodo %d: Soy más alto que %d, pero ya hay una elección en curso.\n", cm.NodeID, senderID)
-		}
-		cm.ElectionLock.Unlock()
-	}
+func (cm *CoordinatorModule) HandleElectionMessage(senderID int) {
+    fmt.Printf("Nodo %d: Recibió ELECTION de %d.\n", cm.NodeID, senderID)
+
+    cm.ElectionLock.Lock()
+    defer cm.ElectionLock.Unlock()
+
+    // --- LÓGICA DE DEFENSA DEL LÍDER ---
+    if cm.IsPrimary {
+        fmt.Printf("Nodo %d (Primario): Ignorando elección de %d y reafirmando mi rol.\n", cm.NodeID, senderID)
+        // Le enviamos un mensaje COORDINATOR al iniciador para que sepa quién manda.
+        cm.SendCoordinatorMessage(senderID, cm.NodeID)
+        return
+    }
+
+    if cm.NodeID > senderID {
+        if !cm.ElectionRunning {
+            fmt.Printf("Nodo %d: Soy más alto que %d. Iniciando mi propia elección.\n", cm.NodeID, senderID)
+            go cm.StartElection()
+        } else {
+            fmt.Printf("Nodo %d: Soy más alto que %d, pero ya hay una elección en curso.\n", cm.NodeID, senderID)
+        }
+    }
 }
 
 // HandleCoordinatorMessage procesa un mensaje COORDINATOR recibido.

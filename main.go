@@ -252,13 +252,8 @@ func (sn *ServerNodeWrapper) Start() {
 
 	go func() {
 		if !sn.NodeState.IsPrimary {
-			lowestNodeID := sn.CoordinatorMod.Nodes[0]
-			if sn.NodeID == lowestNodeID {
-				fmt.Printf("Nodo %d: Soy el de ID más bajo del clúster. Asumiendo responsabilidad de iniciar la primera elección...\n", sn.NodeID)
-				go sn.CoordinatorMod.StartElection()
-			} else {
-				fmt.Printf("Nodo %d: Nodo secundario iniciado. Esperando descubrimiento de líder.\n", sn.NodeID)
-			}
+			fmt.Printf("Nodo %d: Nodo secundario iniciado. Intentando encontrar al primario para sincronizar...\n", sn.NodeID)
+			go sn.CoordinatorMod.StartElection()
 		}
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
