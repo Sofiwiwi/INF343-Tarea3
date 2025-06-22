@@ -1,97 +1,102 @@
 #!/bin/bash
 
-USER_1="ubuntu"
-PASS_1="W8h7F78St81R8L1x" 
-IP_1="10.10.28.17"
-
-USER_2="ubuntu"
-PASS_2="8qS0YRcKfoS9CY5e" 
-IP_2="10.10.28.18"        
-
-USER_3="ubuntu"
-PASS_3="zK2D335HRiGYl7Zp" 
-IP_3="10.10.28.19"      
-
+# --- CONFIGURACIÓN ---
+# Asegúrate de que esta ruta sea correcta.
 PROJECT_PATH="/home/ubuntu/INF343-Tarea3"
+SIMULATION_LOG_FILE="simulation.log" # Nombre del archivo para los logs de este script
 
-# --- FUNCIONES AUXILIARES ---
+IP_NODO_1="10.10.28.17"
+IP_NODO_2="10.10.28.18"
+IP_NODO_3="10.10.28.19"
 
-# Función para imprimir logs con fecha y hora
 log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "${SIMULATION_LOG_FILE}"
 }
 
-# Función para iniciar un nodo en una VM remota
-start_node() {
-    local node_id=$1
-    local user=$2
-    local pass=$3
-    local ip=$4
-
-    log "Iniciando Nodo $node_id en ${ip}..."
-    # Usamos sshpass para pasar la contraseña al comando ssh
-    sshpass -p "${pass}" ssh -o StrictHostKeyChecking=no ${user}@${ip} "cd ${PROJECT_PATH} && nohup go run main.go ${node_id} > node${node_id}.log 2>&1 & echo \$! > node.pid"
-    log "Nodo $node_id iniciado."
+start_go_process() {
+    if [ -f "node.pid" ]; then
+        log "El proceso del nodo ya parece estar en ejecución. Saliendo."
+        exit 1
+    fi
+    log "Iniciando proceso del Nodo ${NODE_ID}..."
+    cd ${PROJECT_PATH}
+    nohup go run main.go ${NODE_ID} > "node${NODE_ID}.log" 2>&1 &
+    echo $! > "node.pid"
+    log "Proceso del Nodo ${NODE_ID} iniciado con PID $(cat node.pid). Log en node${NODE_ID}.log"
 }
 
-# Función para detener un nodo en una VM remota
-stop_node() {
-    local node_id=$1
-    local user=$2
-    local pass=$3
-    local ip=$4
-
-    log "Deteniendo Nodo $node_id en ${ip}..."
-    sshpass -p "${pass}" ssh -o StrictHostKeyChecking=no ${user}@${ip} "if [ -f ${PROJECT_PATH}/node.pid ]; then kill \$(cat ${PROJECT_PATH}/node.pid) && rm ${PROJECT_PATH}/node.pid; echo 'Nodo detenido.'; else echo 'PID no encontrado, el nodo podría estar ya detenido.'; fi"
-    log "Comando de detención enviado al Nodo $node_id."
+# Detiene el proceso 'go run' usando el archivo PID
+stop_go_process() {
+    if [ -f "node.pid" ]; then
+        log "Deteniendo proceso del Nodo ${NODE_ID} (PID $(cat node.pid))."
+        kill $(cat "node.pid")
+        rm "node.pid"
+        log "Proceso detenido."
+    else
+        log "No se encontró el archivo node.pid. El proceso podría no estar en ejecución."
+    fi
 }
 
 
-# --- LÓGICA DE LA SIMULACIÓN ---
+# --- LÓGICA PRINCIPAL ---
 
-# Limpieza: si se ejecuta el script con "cleanup", detiene todos los nodos.
+# 1. IDENTIFICACIÓN DEL NODO
+LOCAL_IP=$(hostname -I | awk '{print $1}')
+NODE_ID=0
+
+case ${LOCAL_IP} in
+    "${IP_NODO_1}")
+        NODE_ID=1
+        ;;
+    "${IP_NODO_2}")
+        NODE_ID=2
+        ;;
+    "${IP_NODO_3}")
+        NODE_ID=3
+        ;;
+    *)
+        echo "ERROR: La IP local (${LOCAL_IP}) no coincide con ninguna IP configurada en el script."
+        exit 1
+        ;;
+esac
+
+# 2. MANEJO DE ARGUMENTOS (EJ: ./local_simulation.sh cleanup)
 if [ "$1" == "cleanup" ]; then
-    log "Iniciando limpieza de todos los nodos..."
-    stop_node 1 $USER_1 $PASS_1 $IP_1
-    stop_node 2 $USER_2 $PASS_2 $IP_2
-    stop_node 3 $USER_3 $PASS_3 $IP_3
+    # Limpiamos el archivo de log para la ejecución de la limpieza.
+    > "${SIMULATION_LOG_FILE}"
+    log "Ejecutando limpieza para el Nodo ${NODE_ID}..."
+    stop_go_process
     log "Limpieza completada."
     exit 0
 fi
 
 
-log "========= INICIO DE LA SIMULACIÓN ========="
-
-log "PASO 1: Iniciando los tres nodos del clúster."
-start_node 1 $USER_1 $PASS_1 $IP_1
-start_node 2 $USER_2 $PASS_2 $IP_2
-start_node 3 $USER_3 $PASS_3 $IP_3
-echo ""
-log "Nodos iniciados. Dando 15 segundos para la elección del líder inicial..."
-log "Puedes revisar los logs en cada VM ('tail -f nodeX.log') para ver el proceso."
-sleep 15
+# 3. INICIO DE SIMULACIÓN Y LOGS
+# Limpiamos el archivo de log anterior para empezar de cero en esta ejecución.
+> "${SIMULATION_LOG_FILE}"
+log "Script ejecutado en una máquina identificada como Nodo ${NODE_ID}."
+log "Los logs de esta simulación se guardarán en '${SIMULATION_LOG_FILE}'."
 
 
-echo ""
-log "PASO 2: Simulando la caída del líder (Nodo 3)."
-stop_node 3 $USER_3 $PASS_3 $IP_3
-echo ""
-log "Líder (Nodo 3) detenido. Dando 15 segundos para que los nodos 1 y 2 detecten la falla y elijan un nuevo líder..."
-sleep 15
+# 4. LÓGICA DE SIMULACIÓN BASADA EN EL ID DEL NODO
+if [ ${NODE_ID} -eq 3 ]; then
+    # --- Comportamiento del Líder Inicial (Nodo 3) ---
+    log "Rol de simulación: LÍDER INICIAL."
+    start_go_process
+    log "El nodo estará activo por 45 segundos y luego simulará una caída."
+    log "Observa los logs de los otros nodos para ver la elección del nuevo líder."
+    sleep 45
 
-echo ""
-log "PASO 3: Reintegrando al líder anterior (Nodo 3)."
-start_node 3 $USER_3 $PASS_3 $IP_3
-echo ""
-log "Nodo 3 reiniciado. Se reintegrará al clúster como secundario y se sincronizará con el nuevo líder (Nodo 2)."
-log "Dando 20 segundos para observar el comportamiento normal con el nuevo líder..."
-sleep 20
+    log "SIMULANDO CAÍDA DEL LÍDER."
+    stop_go_process
+    echo "" | tee -a "${SIMULATION_LOG_FILE}" # Añade una línea en blanco para legibilidad
+    log "El nodo ha sido detenido."
+    log "Para simular la REINTEGRACIÓN, simplemente vuelve a ejecutar este script ('./local_simulation_file_logs.sh') en esta misma máquina."
 
-echo ""
-log "PASO 4: Simulación de eventos."
-log "El sistema ahora está estable con el Nodo 2 como primario y los Nodos 1 y 3 como secundarios."
-log "La simulación de eventos (mensajes automáticos) continúa en el primario activo, y se replica a los secundarios."
-log "Puedes verificar los logs para confirmar la consistencia del número de secuencia."
-echo ""
-log "========= SIMULACIÓN COMPLETADA ========="
-log "Para detener todos los nodos, ejecuta: ./simulation_with_password.sh cleanup"
+else
+    # --- Comportamiento de los Secundarios (Nodos 1 y 2) ---
+    log "Rol de simulación: SECUNDARIO."
+    start_go_process
+    log "Este nodo permanecerá activo, esperando la caída del líder y participando en la nueva elección."
+    log "La simulación se completará en este nodo. Para detener, ejecuta: ./local_simulation_file_logs.sh cleanup"
+fi
