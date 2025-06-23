@@ -151,6 +151,9 @@ func (sn *ServerNodeWrapper) injectCommunicationFunctions() {
 	sn.SyncMod.SendLogEntriesMessage = func(targetID int, entries []servernode.Evento, newSequenceNumber int) {
 		payload := map[string]interface{}{"entries": entries, "sequence_number": newSequenceNumber}
 		resp, err := sn.sendAPIRequest(targetID, "POST", "/send-log", payload)
+		if err != nil {
+			fmt.Printf("Nodo %d (Primario): [SONDA] Error de red al intentar enviar /send-log al Nodo %d. Error: %v\n", sn.NodeID, targetID, err)
+		}
 		if err == nil {
 			resp.Body.Close()
 		}

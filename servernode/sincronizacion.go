@@ -57,17 +57,11 @@ func NewSynchronizationModule(nodeID int, coordinator *CoordinatorModule, curren
 func (sm *SynchronizationModule) HandleRequestStateMessage(senderID int) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
-	// Si este nodo es el primario, envía su estado completo
 	if sm.NodeState.IsPrimary {
 		fmt.Printf("Nodo %d (Primario): Recibida solicitud de estado de %d. Enviando estado actual (Seq: %d).\n", sm.NodeID, senderID, sm.CurrentState.SequenceNumber)
 		sm.SendStateMessage(senderID, *sm.CurrentState)
 	} else {
-		// Si no es el primario, puede que el solicitante no sepa quién es el primario
-		// O podría redirigir la solicitud al primario conocido.
 		fmt.Printf("Nodo %d (Secundario): Recibida solicitud de estado de %d, pero no soy primario. Primario conocido: %d.\n", sm.NodeID, senderID, sm.Coordinator.PrimaryID)
-		// Opcional: Podríamos enviar un mensaje al senderID diciéndole quién es el primario
-		// Esto dependerá del protocolo de comunicación deseado.
 	}
 }
 
@@ -75,12 +69,9 @@ func (sm *SynchronizationModule) HandleRequestStateMessage(senderID int) {
 func (sm *SynchronizationModule) UpdateState(newState *Estado) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
-	// Solo actualiza si el estado recibido es más reciente
 	if newState.SequenceNumber > sm.CurrentState.SequenceNumber {
 		sm.CurrentState = newState
 		fmt.Printf("Nodo %d: Estado actualizado a SequenceNumber %d. Eventos: %d.\n", sm.NodeID, sm.CurrentState.SequenceNumber, len(sm.CurrentState.EventLog))
-		// Persistir el estado después de actualizarlo
 		sm.PersistenceModule.SaveState(sm.CurrentState)
 	} else {
 		fmt.Printf("Nodo %d: Recibido estado con SequenceNumber %d, pero el local es %d. No se actualiza.\n", sm.NodeID, newState.SequenceNumber, sm.CurrentState.SequenceNumber)
@@ -136,24 +127,12 @@ func (sm *SynchronizationModule) AddEvent(event Evento) {
 func (sm *SynchronizationModule) ReplicateEventToSecondaries(event Evento, newSequence int) {
 	sm.mu.Lock() // Proteger la lista de nodos si se modificara
 	defer sm.mu.Unlock()
-
-	// Corregido: \\n a \n
 	fmt.Printf("Nodo %d (Primario): Replicando evento (ID: %d, Seq: %d) a todos los secundarios.\n", sm.NodeID, event.ID, newSequence)
-	// Para un sistema real, se enviarían solo las entradas de log nuevas o un diff.
-	// Por simplicidad, se puede enviar el último evento y el nuevo SequenceNumber.
-	// O se puede enviar un "mini-log" con los cambios desde la última sincronización conocida.
-
-	// Aquí vamos a enviar el último evento añadido, asumiendo que los secundarios lo aplican si su SN es menor.
-	// Para el caso de recuperación, se usa SendStateMessage.
-	// Para replicación normal, solo se envía el nuevo evento y su SN.
-	// Pero el PDF dice "se asegura de que todos los servidores mantengan una réplica idéntica del estado",
-	// lo que sugiere que podrían necesitar el log completo o una parte.
-	// La forma más simple y robusta es enviar solo las nuevas entradas de log con el SN.
 	newEntries := []Evento{event} // Enviar solo el último evento añadido
 
 	for _, targetID := range sm.Coordinator.Nodes { // Usa la lista de nodos del coordinador
-		if targetID != sm.NodeID { // No enviar a sí mismo
-			// Aquí se debería enviar un mensaje específico para añadir entradas de log
+		fmt.Printf("Nodo %d (Primario): [SONDA] Dentro del bucle de replicación. Intentando contactar al Nodo %d.\n", sm.NodeID, targetID)
+		if targetID != sm.NodeID { 
 			sm.SendLogEntriesMessage(targetID, newEntries, newSequence)
 		}
 	}
