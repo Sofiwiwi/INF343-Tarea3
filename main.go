@@ -260,9 +260,20 @@ func (sn *ServerNodeWrapper) Start() {
 	}
 
 	go func() {
+		time.Sleep(12 * time.Second)
+		sn.CoordinatorMod.ElectionLock.Lock()
+		knownPrimary := sn.CoordinatorMod.PrimaryID
+		sn.CoordinatorMod.ElectionLock.Unlock()
+
+		if !sn.NodeState.IsPrimary && knownPrimary != -1 {
+			fmt.Printf("Nodo %d: (Reintento) solicitando estado al primario %d\n", sn.NodeID, knownPrimary)
+			sn.SyncMod.ReconcileStateWithPrimary()
+		}
+	}()
+
+	go func() {
 		if !sn.NodeState.IsPrimary {
 			lowestNodeID := sn.CoordinatorMod.Nodes[0]
-
 			if sn.NodeID == lowestNodeID {
 				fmt.Printf("Nodo %d: Soy el de ID más bajo del clúster. Asumiendo responsabilidad de iniciar la primera elección...\n", sn.NodeID)
 				go sn.CoordinatorMod.StartElection()
@@ -270,6 +281,7 @@ func (sn *ServerNodeWrapper) Start() {
 				fmt.Printf("Nodo %d: Nodo secundario iniciado. Esperando descubrimiento de líder.\n", sn.NodeID)
 			}
 		}
+
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -329,7 +341,8 @@ func (sn *ServerNodeWrapper) Start() {
 							continue
 						}
 						if sn.MonitorMod.SendHeartbeat(id) {
-							fmt.Printf("Nodo %d (Primario): Nodo %d está activo. Replicando estado...\n", sn.NodeID, id)
+							fmt.Printf("Nodo %d (Primario): Nodo %d está activo. Enviando COORDINATOR + replicando estado...\n", sn.NodeID, id)
+							sn.CoordinatorMod.SendCoordinatorMessage(id, sn.NodeID)
 							sn.SyncMod.SendStateMessage(id, *sn.CurrentState)
 						}
 					}
@@ -337,6 +350,7 @@ func (sn *ServerNodeWrapper) Start() {
 			}
 		}
 	}()
+
 	<-sn.StopChan
 	fmt.Printf("Nodo %d: Detenido.\n", sn.NodeID)
 }
