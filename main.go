@@ -248,13 +248,16 @@ func (sn *ServerNodeWrapper) startApiServer() {
 	}
 }
 
-// Start inicia todos los procesos en segundo plano del nodo.
 func (sn *ServerNodeWrapper) Start() {
 	fmt.Printf("Nodo %d: Iniciando...\n", sn.NodeID)
 	go sn.startApiServer() // Inicia el servidor API
 
-	// Espera un poco para que los servidores de los otros nodos se inicien
 	time.Sleep(7 * time.Second)
+
+	if !sn.NodeState.IsPrimary && sn.CoordinatorMod.PrimaryID != -1 {
+		fmt.Printf("Nodo %d: Reincorporado. Solicita estado al primario %d\n", sn.NodeID, sn.CoordinatorMod.PrimaryID)
+		go sn.SyncMod.ReconcileStateWithPrimary()
+	}
 
 	go func() {
 		if !sn.NodeState.IsPrimary {
@@ -294,32 +297,47 @@ func (sn *ServerNodeWrapper) Start() {
 		}
 	}()
 
-	// Lógica para que el primario simule y replique eventos
 	go func() {
-		// Creamos un ticker que se dispara cada 4 segundos, independientemente de si somos primarios o no.
 		eventTicker := time.NewTicker(4 * time.Second)
 		defer eventTicker.Stop()
 
-		// Bucle infinito que espera los ticks del reloj.
 		for {
 			select {
-			// Se ha recibido un tick.
 			case <-eventTicker.C:
-				// SÓLO SI SOMOS EL PRIMARIO en este preciso momento, generamos un evento.
 				if sn.NodeState.IsPrimary {
 					fmt.Printf("Nodo %d (Primario): Generando evento periódico...\n", sn.NodeID)
-					// Simula un nuevo evento
 					newEvent := servernode.Evento{Value: fmt.Sprintf("Evento_simulado_del_Nodo_%d_a_las_%s", sn.NodeID, time.Now().Format("15:04:05"))}
 					sn.SyncMod.AddEvent(newEvent)
 				}
-			// El nodo se está deteniendo, salimos del bucle.
 			case <-sn.StopChan:
 				return
 			}
 		}
 	}()
 
-	<-sn.StopChan // Bloquea hasta que se llame a Stop()
+	go func() {
+		if sn.NodeState.IsPrimary {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-sn.StopChan:
+					return
+				case <-ticker.C:
+					for id := range sn.NodeAddresses {
+						if id == sn.NodeID {
+							continue
+						}
+						if sn.MonitorMod.SendHeartbeat(id) {
+							fmt.Printf("Nodo %d (Primario): Nodo %d está activo. Replicando estado...\n", sn.NodeID, id)
+							sn.SyncMod.SendStateMessage(id, *sn.CurrentState)
+						}
+					}
+				}
+			}
+		}
+	}()
+	<-sn.StopChan
 	fmt.Printf("Nodo %d: Detenido.\n", sn.NodeID)
 }
 
