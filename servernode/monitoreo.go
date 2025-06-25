@@ -69,10 +69,3 @@ func (mm *MonitorModule) CheckPrimary() {
 		go mm.Coordinator.StartElection()
 	}
 }
-/* Funcion reemplazada en main.go
-// SendHeartbeat simula el envío de un mensaje de latido al primario
-func (mm *MonitorModule) SendHeartbeat(targetID int) bool {
-	time.Sleep(500 * time.Millisecond)
-	return false // Simula que el primario ha caído
-}
-*/

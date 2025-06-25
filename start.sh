@@ -30,5 +30,4 @@ fi
 # --- INICIO DEL NODO ---
 echo "[INFO] Iniciando proceso del Nodo ${NODE_ID} en segundo plano..."
 nohup go run main.go ${NODE_ID} > "node${NODE_ID}.log" 2>&1 &
-echo $! > "node.pid"
-echo "[OK] Nodo ${NODE_ID} iniciado con PID $(cat node.pid). Log en node${NODE_ID}.log"
+echo "[OK] Nodo ${NODE_ID} iniciado. Log en node${NODE_ID}.log"

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"io/ioutil"
 	//"sync"
 	"time"
 )
@@ -282,15 +283,15 @@ func (sn *ServerNodeWrapper) Start() {
 	}
 
 	go func() {
-    time.Sleep(2 * time.Second)
-    if !sn.NodeState.IsPrimary && sn.CoordinatorMod.PrimaryID != -1 {
-        fmt.Printf("Nodo %d: Notificando mi reactivación al primario %d\n", sn.NodeID, sn.CoordinatorMod.PrimaryID)
-        _, err := sn.sendAPIRequest(sn.CoordinatorMod.PrimaryID, "POST", "/reactivated", map[string]int{"node_id": sn.NodeID})
-        if err != nil {
-            fmt.Printf("Nodo %d: Error al notificar reactivación al primario: %v\n", sn.NodeID, err)
-        }
-    }
-}()
+		time.Sleep(2 * time.Second)
+		if !sn.NodeState.IsPrimary && sn.CoordinatorMod.PrimaryID != -1 {
+			fmt.Printf("Nodo %d: Notificando mi reactivación al primario %d\n", sn.NodeID, sn.CoordinatorMod.PrimaryID)
+			_, err := sn.sendAPIRequest(sn.CoordinatorMod.PrimaryID, "POST", "/reactivated", map[string]int{"node_id": sn.NodeID})
+			if err != nil {
+				fmt.Printf("Nodo %d: Error al notificar reactivación al primario: %v\n", sn.NodeID, err)
+			}
+		}
+	}()
 
 
 	go func() {
@@ -307,12 +308,17 @@ func (sn *ServerNodeWrapper) Start() {
 
 	go func() {
 		if !sn.NodeState.IsPrimary {
-			lowestNodeID := sn.CoordinatorMod.Nodes[0]
-			if sn.NodeID == lowestNodeID {
-				fmt.Printf("Nodo %d: Soy el de ID más bajo del clúster. Asumiendo responsabilidad de iniciar la primera elección...\n", sn.NodeID)
-				go sn.CoordinatorMod.StartElection()
+			if sn.CurrentState.SequenceNumber == 0 {
+				lowestNodeID := sn.CoordinatorMod.Nodes[0]
+				if sn.NodeID == lowestNodeID {
+					fmt.Printf("Nodo %d: Soy el de ID más bajo en un arranque desde cero. Iniciando elección del Matón...\n", sn.NodeID)
+					go sn.CoordinatorMod.StartElection() // Elección estándar (solo a IDs >)
+				} else {
+					fmt.Printf("Nodo %d: Nodo secundario en arranque desde cero. Esperando elección...\n", sn.NodeID)
+				}
 			} else {
-				fmt.Printf("Nodo %d: Nodo secundario iniciado. Esperando descubrimiento de líder.\n", sn.NodeID)
+				fmt.Printf("Nodo %d: Reintegrándose al clúster. Iniciando sondeo de descubrimiento.\n", sn.NodeID)
+				go sn.CoordinatorMod.DiscoverLeader() // Nueva función de descubrimiento (a TODOS)
 			}
 		}
 
@@ -430,6 +436,13 @@ func main() {
 	}
 
 	node := NewServerNodeWrapper(nodeID, allNodeIDs, nodeAddresses)
+
+	pid := os.Getpid()
+	pidStr := strconv.Itoa(pid)
+	err = ioutil.WriteFile("node.pid", []byte(pidStr), 0644)
+	if err != nil {
+		log.Fatalf("Nodo %d: No se pudo escribir el archivo PID: %v", nodeID, err)
+	}
 	
 	// Utiliza un canal para esperar una señal de interrupción (Ctrl+C) y detener el nodo limpiamente.
 	sigChan := make(chan os.Signal, 1)

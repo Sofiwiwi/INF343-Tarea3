@@ -182,6 +182,16 @@ func (cm *CoordinatorModule) HandleCoordinatorMessage(coordinatorID int) {
 	}
 }
 
+func (cm *CoordinatorModule) DiscoverLeader() {
+    fmt.Printf("Nodo %d: Iniciando sondeo de descubrimiento de líder...\n", cm.NodeID)
+    for _, targetID := range cm.Nodes {
+        if targetID == cm.NodeID {
+            continue
+        }
+        go cm.SendElectionMessage(targetID)
+    }
+}
+
 // SaveNodeStateToFile guarda el estado del nodo (si es primario) en un archivo JSON.
 func (n *Nodo) SaveNodeStateToFile() error {
 	fileName := fmt.Sprintf("node_%d.json", n.ID)
