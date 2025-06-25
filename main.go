@@ -226,6 +226,28 @@ func (sn *ServerNodeWrapper) startApiServer() {
 			w.WriteHeader(http.StatusBadRequest)
 		}
 	})
+
+	mux.HandleFunc("/reactivated", func(w http.ResponseWriter, r *http.Request) {
+		if !sn.NodeState.IsPrimary {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+
+		var payload struct {
+			NodeID int `json:"node_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		fmt.Printf("Nodo %d (Primario): Nodo %d se ha reincorporado. Enviando COORDINATOR y estado.\n", sn.NodeID, payload.NodeID)
+		sn.CoordinatorMod.SendCoordinatorMessage(payload.NodeID, sn.NodeID)
+		sn.SyncMod.SendStateMessage(payload.NodeID, *sn.CurrentState)
+		w.WriteHeader(http.StatusOK)
+	})
+
+
 	// Endpoint para simular la llegada de un nuevo evento al primario
 	mux.HandleFunc("/add-event", func(w http.ResponseWriter, r *http.Request) {
 		if !sn.NodeState.IsPrimary {
@@ -258,6 +280,18 @@ func (sn *ServerNodeWrapper) Start() {
 		fmt.Printf("Nodo %d: Reincorporado. Solicita estado al primario %d\n", sn.NodeID, sn.CoordinatorMod.PrimaryID)
 		go sn.SyncMod.ReconcileStateWithPrimary()
 	}
+
+	go func() {
+    time.Sleep(2 * time.Second)
+    if !sn.NodeState.IsPrimary && sn.CoordinatorMod.PrimaryID != -1 {
+        fmt.Printf("Nodo %d: Notificando mi reactivación al primario %d\n", sn.NodeID, sn.CoordinatorMod.PrimaryID)
+        _, err := sn.sendAPIRequest(sn.CoordinatorMod.PrimaryID, "POST", "/reactivated", map[string]int{"node_id": sn.NodeID})
+        if err != nil {
+            fmt.Printf("Nodo %d: Error al notificar reactivación al primario: %v\n", sn.NodeID, err)
+        }
+    }
+}()
+
 
 	go func() {
 		time.Sleep(12 * time.Second)
