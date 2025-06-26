@@ -8,6 +8,7 @@ type Evento struct {
 type Estado struct {
 	SequenceNumber int      `json:"sequence_number"`
 	EventLog       []Evento `json:"event_log"`
+	LastEventID    int      `json:"last_event_id"`
 }
 
 type Nodo struct {

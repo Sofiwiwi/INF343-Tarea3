@@ -72,6 +72,8 @@ func (sm *SynchronizationModule) UpdateState(newState *Estado) {
 	if newState.SequenceNumber > sm.CurrentState.SequenceNumber {
 		sm.CurrentState = newState
 		fmt.Printf("Nodo %d: Estado actualizado a SequenceNumber %d. Eventos: %d.\n", sm.NodeID, sm.CurrentState.SequenceNumber, len(sm.CurrentState.EventLog))
+		sm.NodeState.LastMessage = time.Now().Format(time.RFC3339)
+		sm.NodeState.SaveNodeStateToFile() // Persiste el cambio en node_X.json
 		sm.PersistenceModule.SaveState(sm.CurrentState)
 	} else {
 		fmt.Printf("Nodo %d: Recibido estado con SequenceNumber %d, pero el local es %d. No se actualiza.\n", sm.NodeID, newState.SequenceNumber, sm.CurrentState.SequenceNumber)
@@ -103,23 +105,21 @@ func (sm *SynchronizationModule) ReconcileStateWithPrimary() {
 func (sm *SynchronizationModule) AddEvent(event Evento) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
-	// Solo el primario actualiza el estado local de esta manera y replica
 	if sm.NodeState.IsPrimary {
-		sm.CurrentState.SequenceNumber++
+		sm.CurrentState.LastEventID++
+		event.ID = sm.CurrentState.LastEventID
+
 		sm.CurrentState.EventLog = append(sm.CurrentState.EventLog, event)
-		// Corregido: \\n a \n
+		sm.CurrentState.SequenceNumber++ 
 		fmt.Printf("Nodo %d (Primario): Nuevo evento añadido. Seq: %d, EventID: %d\n", sm.NodeID, sm.CurrentState.SequenceNumber, event.ID)
 
-		// Persistir el estado inmediatamente después de actualizarlo
-		sm.PersistenceModule.SaveState(sm.CurrentState) // <-- LLAMADA AL MÓDULO DE PERSISTENCIA
+		sm.NodeState.LastMessage = time.Now().Format(time.RFC3339)
+		sm.NodeState.SaveNodeStateToFile()
 
-		// Después de actualizar su propio estado, el primario debería replicar esto a los secundarios.
+		sm.PersistenceModule.SaveState(sm.CurrentState)
 		sm.ReplicateEventToSecondaries(event, sm.CurrentState.SequenceNumber)
 	} else {
-		// Corregido: \\n a \n
 		fmt.Printf("Nodo %d: Intentó actualizar estado con evento, pero no es primario. Primario conocido: %d\n", sm.NodeID, sm.Coordinator.PrimaryID)
-		// Opcional: Redirigir la solicitud al primario si no lo es.
 	}
 }
 
@@ -138,23 +138,25 @@ func (sm *SynchronizationModule) ReplicateEventToSecondaries(event Evento, newSe
 	}
 }
 
-// AddLogEntries maneja la adición de entradas de log replicadas desde el primario.
 func (sm *SynchronizationModule) AddLogEntries(senderID int, entries []Evento, sequenceNumber int) {
-    sm.mu.Lock()
-    defer sm.mu.Unlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-    if sm.Coordinator.PrimaryID == -1 {
-        fmt.Printf("Nodo %d: Descubierto al líder %d a través de replicación de logs.\n", sm.NodeID, senderID)
-        sm.Coordinator.PrimaryID = senderID
-        sm.Coordinator.PrimaryLastSeen = time.Now()
-    }
+	if sm.Coordinator.PrimaryID == -1 {
+		fmt.Printf("Nodo %d: Descubierto al líder %d a través de replicación de logs.\n", sm.NodeID, senderID)
+		sm.Coordinator.PrimaryID = senderID
+	}
 
-    if sequenceNumber > sm.CurrentState.SequenceNumber {
-        sm.CurrentState.EventLog = append(sm.CurrentState.EventLog, entries...)
-        sm.CurrentState.SequenceNumber = sequenceNumber
-        fmt.Printf("Nodo %d: Entradas de log añadidas. Nuevo SequenceNumber: %d. Total eventos: %d.\n", sm.NodeID, sm.CurrentState.SequenceNumber, len(sm.CurrentState.EventLog))
-        sm.PersistenceModule.SaveState(sm.CurrentState)
-    } else {
-        fmt.Printf("Nodo %d: Ignorando entradas de log con SequenceNumber %d (local es %d).\n", sm.NodeID, sequenceNumber, sm.CurrentState.SequenceNumber)
-    }
+	if sequenceNumber > sm.CurrentState.SequenceNumber {
+		sm.CurrentState.EventLog = append(sm.CurrentState.EventLog, entries...)
+		sm.CurrentState.SequenceNumber = sequenceNumber
+		fmt.Printf("Nodo %d: Entradas de log añadidas. Nuevo SequenceNumber: %d. Total eventos: %d.\n", sm.NodeID, sm.CurrentState.SequenceNumber, len(sm.CurrentState.EventLog))
+
+		sm.NodeState.LastMessage = time.Now().Format(time.RFC3339)
+		sm.NodeState.SaveNodeStateToFile()
+
+		sm.PersistenceModule.SaveState(sm.CurrentState)
+	} else {
+		fmt.Printf("Nodo %d: Ignorando entradas de log con SequenceNumber %d (local es %d).\n", sm.NodeID, sequenceNumber, sm.CurrentState.SequenceNumber)
+	}
 }
