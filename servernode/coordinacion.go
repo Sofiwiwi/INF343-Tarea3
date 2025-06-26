@@ -14,7 +14,6 @@ const (
 	MessageTypeElection    = "ELECTION"
 	MessageTypeCoordinator = "COORDINATOR"
 	MessageTypeAreYouAlive = "ARE_YOU_ALIVE"
-	// MessageTypeOK ya no es necesario, la respuesta HTTP 200 lo reemplaza.
 )
 
 // CoordinatorModule es la estructura para el módulo de coordinación
@@ -81,8 +80,6 @@ func (cm *CoordinatorModule) StartElection() {
 	for _, targetID := range cm.Nodes {
 		if targetID > cm.NodeID {
 			fmt.Printf("Nodo %d: Enviando ELECTION a %d\n", cm.NodeID, targetID)
-			// SendElectionMessage ahora es síncrono. Si devuelve 'true',
-			// un nodo superior ha respondido y tomará el control.
 			if cm.SendElectionMessage(targetID) {
 				fmt.Printf("Nodo %d: Nodo con ID más alto (%d) respondió. Cediendo elección.\n", cm.NodeID, targetID)
 				higherNodesResponded = true
@@ -94,7 +91,6 @@ func (cm *CoordinatorModule) StartElection() {
 	cm.ElectionLock.Lock()
 	defer cm.ElectionLock.Unlock()
 
-	// Es importante verificar si la elección sigue siendo "nuestra"
 	if !cm.ElectionRunning {
 		fmt.Printf("Nodo %d: La elección fue cedida o cancelada. No se tomarán más acciones.\n", cm.NodeID)
 		return
@@ -103,7 +99,6 @@ func (cm *CoordinatorModule) StartElection() {
 	if higherNodesResponded {
 		cm.ElectionRunning = false // Se cede la elección
 		fmt.Printf("Nodo %d: Esperando mensaje COORDINATOR del nuevo líder.\n", cm.NodeID)
-		// Se establece un temporizador. Si no se anuncia un nuevo coordinador, se inicia otra elección.
 		go func() {
 			time.Sleep(7 * time.Second) // Tiempo de espera para el anuncio del coordinador
 			cm.ElectionLock.Lock()
@@ -143,10 +138,9 @@ func (cm *CoordinatorModule) HandleElectionMessage(senderID int) {
     cm.ElectionLock.Lock()
     defer cm.ElectionLock.Unlock()
 
-    // --- LÓGICA DE DEFENSA DEL LÍDER ---
+    // Si ya hay un primario, ignoramos la elección.
     if cm.IsPrimary {
         fmt.Printf("Nodo %d (Primario): Ignorando elección de %d y reafirmando mi rol.\n", cm.NodeID, senderID)
-        // Le enviamos un mensaje COORDINATOR al iniciador para que sepa quién manda.
         cm.SendCoordinatorMessage(senderID, cm.NodeID)
         return
     }
@@ -165,17 +159,14 @@ func (cm *CoordinatorModule) HandleElectionMessage(senderID int) {
 func (cm *CoordinatorModule) HandleCoordinatorMessage(coordinatorID int) {
 	cm.ElectionLock.Lock()
 	defer cm.ElectionLock.Unlock()
-
 	// Solo se actualiza si el nuevo coordinador tiene un ID mayor o si no había primario
 	if coordinatorID > cm.PrimaryID || cm.PrimaryID == -1 {
 		fmt.Printf("Nodo %d: Recibido COORDINATOR. Nuevo primario es %d.\n", cm.NodeID, coordinatorID)
 		cm.PrimaryID = coordinatorID
 		cm.IsPrimary = (cm.NodeID == coordinatorID)
 		cm.ElectionRunning = false // Detiene cualquier elección en curso
-
 		cm.NodeState.IsPrimary = cm.IsPrimary
 		cm.NodeState.SaveNodeStateToFile()
-
 		cm.PrimaryLastSeen = time.Now()
 	} else {
 		fmt.Printf("Nodo %d: Ignorando mensaje COORDINATOR de %d porque el primario actual (%d) es más alto.\n", cm.NodeID, coordinatorID, cm.PrimaryID)

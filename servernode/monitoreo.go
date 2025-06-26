@@ -25,7 +25,7 @@ func NewMonitorModule(nodeID int, primaryID int, coordinator *CoordinatorModule)
 		NodeID:      nodeID,
 		PrimaryID:   primaryID,
 		Coordinator: coordinator,
-		Ticker:      time.NewTicker(3 * time.Second), // monitoreo cada 3 segundos
+		Ticker:      time.NewTicker(3 * time.Second),
 		Done:        make(chan bool),
 	}
 }
@@ -54,16 +54,11 @@ func (mm *MonitorModule) Stop() {
 func (mm *MonitorModule) CheckPrimary() {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
-
-	// No monitorea si este nodo es el primario
 	if mm.Coordinator.IsPrimary {
 		return
 	}
-
 	fmt.Printf("Nodo %d: Enviando ARE_YOU_ALIVE al primario %d...\n", mm.NodeID, mm.Coordinator.PrimaryID)
-
 	alive := mm.SendHeartbeat(mm.Coordinator.PrimaryID)
-
 	if !alive {
 		fmt.Printf("Nodo %d: ¡El primario %d no respondió! Iniciando elección...\n", mm.NodeID, mm.Coordinator.PrimaryID)
 		go mm.Coordinator.StartElection()

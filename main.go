@@ -26,7 +26,7 @@ type ServerNodeWrapper struct {
 	StopChan       chan struct{}
 	NodeAddresses  map[int]string
 	MonitorStarted bool
-	httpClient     *http.Client // Cliente HTTP para la comunicación entre nodos
+	httpClient     *http.Client 
 }
 
 // NewServerNodeWrapper crea e inicializa un nuevo nodo con todos sus módulos.
@@ -37,7 +37,6 @@ func NewServerNodeWrapper(id int, allNodeIDs []int, nodeAddresses map[int]string
 		fmt.Printf("Nodo %d: Error cargando estado del nodo: %v. Creando nuevo estado.\n", id, err)
 		nodeState = &servernode.Nodo{ID: id, IsPrimary: false}
 	}
-
 	// Carga del estado replicado (el log de eventos)
 	persistenceMod := servernode.NewPersistenceModule(id)
 	currentState, err := persistenceMod.LoadState()
@@ -45,7 +44,6 @@ func NewServerNodeWrapper(id int, allNodeIDs []int, nodeAddresses map[int]string
 		fmt.Printf("Nodo %d: Error cargando estado replicado: %v. Inicializando vacío.\n", id, err)
 		currentState = &servernode.Estado{SequenceNumber: 0, EventLog: []servernode.Evento{}}
 	}
-
 	sn := &ServerNodeWrapper{
 		NodeID:         id,
 		NodeState:      nodeState,
@@ -54,16 +52,13 @@ func NewServerNodeWrapper(id int, allNodeIDs []int, nodeAddresses map[int]string
 		PersistenceMod: persistenceMod,
 		NodeAddresses:  nodeAddresses,
 		httpClient: &http.Client{
-			Timeout: 2 * time.Second, // Timeout para las llamadas API
+			Timeout: 2 * time.Second, 
 		},
 	}
-
 	// Inicialización de los módulos
 	sn.CoordinatorMod = servernode.NewCoordinatorModule(id, allNodeIDs, sn.NodeState)
 	sn.MonitorMod = servernode.NewMonitorModule(id, -1, sn.CoordinatorMod)
 	sn.SyncMod = servernode.NewSynchronizationModule(id, sn.CoordinatorMod, sn.CurrentState, sn.NodeState, sn.PersistenceMod)
-
-	// Inyección de dependencias de comunicación (funciones que usan el cliente HTTP)
 	sn.injectCommunicationFunctions()
 
 	return sn
@@ -76,7 +71,6 @@ func (sn *ServerNodeWrapper) sendAPIRequest(targetID int, method, endpoint strin
 		return nil, fmt.Errorf("dirección desconocida para el nodo %d", targetID)
 	}
 	url := fmt.Sprintf("http://%s%s", targetAddr, endpoint)
-
 	var reqBody []byte
 	var err error
 	if payload != nil {
@@ -85,15 +79,12 @@ func (sn *ServerNodeWrapper) sendAPIRequest(targetID int, method, endpoint strin
 			return nil, fmt.Errorf("error al serializar payload: %w", err)
 		}
 	}
-
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("error al crear request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	// Se añade un header para identificar al emisor, útil en los handlers
 	req.Header.Set("X-Sender-ID", strconv.Itoa(sn.NodeID))
-
 	return sn.httpClient.Do(req)
 }
 
@@ -103,11 +94,10 @@ func (sn *ServerNodeWrapper) injectCommunicationFunctions() {
 	sn.CoordinatorMod.SendElectionMessage = func(targetID int) bool {
 		resp, err := sn.sendAPIRequest(targetID, "POST", "/election", nil)
 		if err != nil || resp.StatusCode != http.StatusOK {
-			// Si hay error o el status no es OK, se considera que no respondió.
 			return false
 		}
 		resp.Body.Close()
-		return true // Un 200 OK significa que el nodo superior respondió.
+		return true
 	}
 
 	sn.CoordinatorMod.SendCoordinatorMessage = func(targetID, coordinatorID int) {
@@ -135,7 +125,6 @@ func (sn *ServerNodeWrapper) injectCommunicationFunctions() {
 
 	// --- Funciones para el Módulo de Sincronización ---
 	sn.SyncMod.SendRequestStateMessage = func(targetID int, payload string) {
-		// El payload de esta función no se usa en la nueva implementación.
 		resp, err := sn.sendAPIRequest(targetID, "POST", "/request-state", nil)
 		if err == nil {
 			resp.Body.Close()
@@ -210,17 +199,14 @@ func (sn *ServerNodeWrapper) startApiServer() {
 		}
 	})
 
-	// Endpoint para recibir nuevas entradas del log
-
+	// Endpoint para recibir entradas de log del primario
 	mux.HandleFunc("/send-log", func(w http.ResponseWriter, r *http.Request) {
-		// Obtenemos la ID del emisor desde el header
 		senderID, _ := strconv.Atoi(r.Header.Get("X-Sender-ID"))
 		var payload struct {
 			Entries        []servernode.Evento `json:"entries"`
 			SequenceNumber int                 `json:"sequence_number"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err == nil {
-			// Pasamos la senderID a la función
 			sn.SyncMod.AddLogEntries(senderID, payload.Entries, payload.SequenceNumber)
 			w.WriteHeader(http.StatusOK)
 		} else {
@@ -273,7 +259,7 @@ func (sn *ServerNodeWrapper) startApiServer() {
 
 func (sn *ServerNodeWrapper) Start() {
 	fmt.Printf("Nodo %d: Iniciando...\n", sn.NodeID)
-	go sn.startApiServer() // Inicia el servidor API
+	go sn.startApiServer()
 
 	time.Sleep(7 * time.Second)
 
@@ -444,7 +430,6 @@ func main() {
 		log.Fatalf("Nodo %d: No se pudo escribir el archivo PID: %v", nodeID, err)
 	}
 	
-	// Utiliza un canal para esperar una señal de interrupción (Ctrl+C) y detener el nodo limpiamente.
 	sigChan := make(chan os.Signal, 1)
 	go func() {
 		<-sigChan

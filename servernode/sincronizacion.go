@@ -1,14 +1,12 @@
-// servernode/sincronizacion.go
 package servernode
 
 import (
-	// Asegurado que esté importado para la consistencia del Message struct
 	"fmt"
 	"sync"
 	"time"
 )
 
-// Definimos nuevos tipos de mensajes para la sincronización
+// Definimos los tipos de mensajes para la sincronización
 const (
 	MessageTypeRequestState = "REQUEST_STATE"
 	MessageTypeSendState    = "SEND_STATE"
@@ -16,8 +14,6 @@ const (
 	MessageTypeSendLog      = "SEND_LOG"
 )
 
-// Message representa un mensaje genérico entre nodos (copiado de coordinacion.go para no tener dependencia circular)
-// Se añaden las json tags para consistencia con el marshalling/unmarshalling en main.go
 type Message struct {
 	SenderID    int    `json:"sender_id"`
 	TargetID    int    `json:"target_id"`
@@ -28,13 +24,11 @@ type Message struct {
 // SynchronizationModule es el módulo encargado de la sincronización del estado
 type SynchronizationModule struct {
 	NodeID            int
-	Coordinator       *CoordinatorModule // Necesita acceso al coordinador para saber quién es el primario
-	CurrentState      *Estado            // Referencia al estado replicado de este nodo
-	NodeState         *Nodo              // Referencia al estado del propio nodo
-	mu                sync.Mutex         // Mutex para proteger el estado durante la sincronización
-	PersistenceModule *PersistenceModule // Referencia al módulo de persistencia
-
-	// Funciones que deben ser inyectadas por el entorno de ejecución (main.go)
+	Coordinator       *CoordinatorModule 
+	CurrentState      *Estado            
+	NodeState         *Nodo              
+	mu                sync.Mutex         
+	PersistenceModule *PersistenceModule
 	SendRequestStateMessage func(targetID int, payload string)
 	SendStateMessage        func(targetID int, state Estado)
 	SendLogEntriesMessage   func(targetID int, entries []Evento, newSequenceNumber int)
@@ -48,7 +42,6 @@ func NewSynchronizationModule(nodeID int, coordinator *CoordinatorModule, curren
 		CurrentState:      currentState,
 		NodeState:         nodeState,
 		PersistenceModule: persistence,
-		// Las funciones de envío se asignarán en main.go
 	}
 }
 
@@ -73,7 +66,7 @@ func (sm *SynchronizationModule) UpdateState(newState *Estado) {
 		sm.CurrentState = newState
 		fmt.Printf("Nodo %d: Estado actualizado a SequenceNumber %d. Eventos: %d.\n", sm.NodeID, sm.CurrentState.SequenceNumber, len(sm.CurrentState.EventLog))
 		sm.NodeState.LastMessage = time.Now().Format(time.RFC3339)
-		sm.NodeState.SaveNodeStateToFile() // Persiste el cambio en node_X.json
+		sm.NodeState.SaveNodeStateToFile() 
 		sm.PersistenceModule.SaveState(sm.CurrentState)
 	} else {
 		fmt.Printf("Nodo %d: Recibido estado con SequenceNumber %d, pero el local es %d. No se actualiza.\n", sm.NodeID, newState.SequenceNumber, sm.CurrentState.SequenceNumber)
@@ -89,15 +82,12 @@ func (sm *SynchronizationModule) ReconcileStateWithPrimary() {
 		fmt.Printf("Nodo %d: No necesita reconciliar, es el primario.\n", sm.NodeID)
 		return
 	}
-
 	primaryID := sm.Coordinator.PrimaryID
 	if primaryID == -1 {
 		fmt.Printf("Nodo %d: No hay primario conocido para reconciliar. Esperando elección.\n", sm.NodeID)
 		return
 	}
-
 	fmt.Printf("Nodo %d: Solicitando estado completo al primario %d...\n", sm.NodeID, primaryID)
-	// Envía un mensaje pidiendo el estado completo al primario
 	sm.SendRequestStateMessage(primaryID, "")
 }
 
@@ -125,12 +115,11 @@ func (sm *SynchronizationModule) AddEvent(event Evento) {
 
 // ReplicateEventToSecondaries replica un evento y el nuevo número de secuencia a todos los secundarios.
 func (sm *SynchronizationModule) ReplicateEventToSecondaries(event Evento, newSequence int) {
-	sm.mu.Lock() // Proteger la lista de nodos si se modificara
+	sm.mu.Lock() 
 	defer sm.mu.Unlock()
 	fmt.Printf("Nodo %d (Primario): Replicando evento (ID: %d, Seq: %d) a todos los secundarios.\n", sm.NodeID, event.ID, newSequence)
-	newEntries := []Evento{event} // Enviar solo el último evento añadido
-
-	for _, targetID := range sm.Coordinator.Nodes { // Usa la lista de nodos del coordinador
+	newEntries := []Evento{event} 
+	for _, targetID := range sm.Coordinator.Nodes { 
 		fmt.Printf("Nodo %d (Primario): [SONDA] Dentro del bucle de replicación. Intentando contactar al Nodo %d.\n", sm.NodeID, targetID)
 		if targetID != sm.NodeID { 
 			sm.SendLogEntriesMessage(targetID, newEntries, newSequence)
@@ -141,12 +130,10 @@ func (sm *SynchronizationModule) ReplicateEventToSecondaries(event Evento, newSe
 func (sm *SynchronizationModule) AddLogEntries(senderID int, entries []Evento, sequenceNumber int) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-
 	if sm.Coordinator.PrimaryID == -1 {
 		fmt.Printf("Nodo %d: Descubierto al líder %d a través de replicación de logs.\n", sm.NodeID, senderID)
 		sm.Coordinator.PrimaryID = senderID
 	}
-
 	if sequenceNumber > sm.CurrentState.SequenceNumber {
 		sm.CurrentState.EventLog = append(sm.CurrentState.EventLog, entries...)
 		sm.CurrentState.SequenceNumber = sequenceNumber
