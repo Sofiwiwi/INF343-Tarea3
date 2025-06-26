@@ -6,14 +6,6 @@
 
 ## Instrucciones de uso:
 
-### Máquinas virtuales (ubuntu):
-1) 10.10.28.17
-   Contraseña: W8h7F78St81R8L1x
-2) 10.10.28.18
-   Contraseña: 8qS0YRcKfoS9CY5e
-3) 10.10.28.19
-   Contraseña: zK2D335HRiGYl7Zp
-
 En cada máquina virtual se encuentra clonado el repositorio con los permisos correspondientes para ejecutar los archivos **bash**. Además se encuentra instalado Go.
 
 (Opcional) Para una limpieza inicial se pueden ejecutar los siguientes comandos en las máquinas:
